@@ -1,0 +1,45 @@
+task: MNIST
+gpu: 2
+dataset: MNIST
+num_classes: 10
+model: CNNMnist
+malicious: 0.2
+attack_epoch: 1
+watermark: false
+defense: "no"
+attack_type: "How_backdoor"
+poison_type: 1
+# "no" "How_backdoor" "dct" "dba"
+agg: "FedAvg"
+# DeepSight FedAvg FoolsGold FLShield FreqFed FndShield Rflbat multi_krum
+flshield_mode: "cluster"
+#"bijective" "cluster"
+a: 0.5
+clients: 100
+epochs: 50
+local_bs: 16
+bs: 128
+lr: 0.01
+# freqfed和flshield:lr=0.001,local_bs=16 最优
+momentum: 0.5
+local_ep: 1
+
+save_model: False
+model_is_pretrained: True
+folder_path: 'trained_model'
+is_back_model: False
+
+origin_target: 8
+aim_target: 1
+test_target: 5
+
+backdoor_clients: []
+# device: "cuda:0"  # 自动检测 GPU 可用性时可忽略
+
+# ========== 新增负蒸馏相关参数 ==========
+negative_distillation: False  # 是否启用负蒸馏
+negative_lambda: 0.2          # 负蒸馏强度超参数
+negative_distill_epochs: 5    # 负蒸馏训练轮数
+negative_lr: 0.0001            # 负蒸馏学习率
+negative_optimizer: "adam"    # 负蒸馏使用的优化器 (可选 adam / sgd)
+temperature: 2.0              # 负蒸馏温度超参数

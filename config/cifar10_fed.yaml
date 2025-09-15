@@ -1,0 +1,35 @@
+task: CIFAR10
+gpu: 1
+dataset: CIFAR10
+num_classes: 10
+model: ResNet18
+malicious: 0.2
+attack_epoch: 0
+watermark: false
+defense: "no"
+attack_type: "How_backdoor"
+# "no" "How_backdoor" "dct"
+agg: "FedAvg"
+# DeepSight FedAvg FoolsGold FLShield FreqFed
+flshield_mode: "cluster"
+#"bijective" "cluster"
+a: 0.5
+clients: 100
+epochs: 50
+local_bs: 16
+bs: 128
+lr: 0.01
+momentum: 0.5
+local_ep: 1
+
+save_model: False
+model_is_pretrained: True
+folder_path: 'trained_model'
+is_back_model: True
+
+origin_target: 8
+aim_target: 1
+test_target: 5
+
+backdoor_clients: []
+#device: "cuda:0"  # 自动检测 GPU 可用性时可忽略该项

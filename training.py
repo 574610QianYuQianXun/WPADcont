@@ -23,13 +23,13 @@ from utils.parameters import Params
 from utils import utils
 from sklearn.decomposition import PCA
 import torch.nn.functional as F
+from purification.ModelPurifier import ModelPurifier
 logger = logging.getLogger('logger')
 
 def load_params_from_yaml(yaml_file: str) -> Params:
     with open(yaml_file) as f:
         yaml_data = yaml.load(f,Loader=yaml.FullLoader)  # 读取 YAML 配置
     return yaml_data  # 直接返回字典
-
 
 def PDBA(global_model, test_dataset, params):
     pdb_dataset = deepcopy(test_dataset)
@@ -438,19 +438,11 @@ def run_fl_round(helper: Helper, epoch, generator):
     # 聚合模型，计算聚合后的模型参数更新量
     Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
-
- # 聚合模型，计算聚合后的模型参数更新量
-    Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
-
-    # ====== 使用 g_trigger 对全局模型进行净化，消除后门 ======
-    # 初始化 g_trigger 变量
-    g_trigger = None
-
+    # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
     if epoch > 0:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
-            # model=helper.clients_model[7],
             tri_dataset = helper.test_dataset,
             attack_size = 5000,  # 用5000个噪声样本做优化
             batch_size = 128
@@ -459,158 +451,30 @@ def run_fl_round(helper: Helper, epoch, generator):
         helper.pattern=pattern
         helper.delta_z=delta_z
 
-        # if delta_z is None:
+        # 使用ModelPurifier进行净化
         if delta_z is not None:
-            g_trigger, fc_names = get_trigger_gradient_vector(
+            # 初始化净化器（如果还没有的话）
+            if not hasattr(helper, 'model_purifier'):
+                helper.model_purifier = ModelPurifier(device=helper.params.device)
+
+            # 执行模型净化
+            purify_result = helper.model_purifier.purify_model(
                 model=helper.global_model,
                 delta_z=delta_z,
                 target_label=helper.params.aim_target,
-                device=helper.params.device
+                clients_update=helper.clients_update,
+                test_dataset=helper.test_dataset,
+                params=helper.params,
+                epoch=epoch
             )
-            print("Trigger gradient vector shape:", g_trigger.shape)
-            print("Got feature trigger:", delta_z.shape)
-            similarities = compute_fc_similarity_with_trigger(helper.clients_update, g_trigger, fc_names)
 
-            sorted_clients = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
-            print("Suspicious ranking (fc layer only):")
-            for cid, sim in sorted_clients:
-                print(f"Client {cid}: similarity={sim:.4f}")
-
-            # ====== 增强净化策略 ======
-            # 1. 累积触发器历史信息
-            if not hasattr(helper, 'trigger_history'):
-                helper.trigger_history = []
-            helper.trigger_history.append(g_trigger.clone())
-
-            # 只保留最近10轮的触发器
-            if len(helper.trigger_history) > 10:
-                helper.trigger_history.pop(0)
-
-            # 2. 计算累积触发器方向（加权平均）
-            weights = torch.linspace(0.5, 1.0, len(helper.trigger_history)).to(helper.params.device)
-            weighted_triggers = []
-            for i, trigger in enumerate(helper.trigger_history):
-                weighted_triggers.append(weights[i] * trigger)
-            accumulated_trigger = torch.stack(weighted_triggers).mean(dim=0)
-
-            # 3. 识别高相似度客户端并动态调整
-            high_sim_clients = [cid for cid, sim in similarities.items() if sim > 0.1]
-            attack_intensity = len(high_sim_clients) / len(similarities)
-            print(f"[攻击强度] {len(high_sim_clients)}/{len(similarities)} 客户端可疑，强度: {attack_intensity:.2f}")
-
-            # 使用 accumulated_trigger 净化全局模型
-            if len(helper.trigger_history) > 0:
-                # 仅对全连接层参数做净化
-                fc_params = [p for n, p in helper.global_model.named_parameters() if "fc" in n]
-                if fc_params:
-                    flat_fc = torch.cat([p.detach().flatten() for p in fc_params])
-
-                    # 使用累积触发器计算投影系数
-                    alpha_acc = torch.dot(flat_fc, accumulated_trigger) / (accumulated_trigger.norm()**2 + 1e-12)
-                    alpha_cur = torch.dot(flat_fc, g_trigger) / (g_trigger.norm()**2 + 1e-12)
-
-                    # ====== 优化的净化策略 ======
-                    # 1. 大幅降低基础净化强度，采用渐进式净化
-                    base_ratio = min(0.15, 0.02 + attack_intensity * 0.1)  # 显著降低净化强度
-
-                    # 2. 基于净化历史的自适应调整（更保守）
-                    if hasattr(helper, 'purify_history') and len(helper.purify_history) >= 2:
-                        recent_main_trend = helper.purify_history[-1]['main_acc'] - helper.purify_history[-2]['main_acc']
-                        recent_bd_trend = helper.purify_history[-1]['backdoor_acc'] - helper.purify_history[-2]['backdoor_acc']
-
-                        # 如果主任务下降但后门没改善，大幅减弱净化
-                        if recent_main_trend < -0.03 and recent_bd_trend > -0.05:
-                            base_ratio *= 0.5
-                            print(f"[净化减弱] 主任务下降但后门未改善，减弱净化强度至 {base_ratio:.3f}")
-                        # 如果后门明显上升，适度增强
-                        elif recent_bd_trend > 0.08:
-                            base_ratio = min(0.25, base_ratio * 1.3)
-                            print(f"[净化增强] 后门攻击率上升，增强净化强度至 {base_ratio:.3f}")
-
-                    # 3. 改进净化方向：使用正交投影而非简单减法
-                    # 先备份原参数
-                    original_params = [p.data.clone() for p in fc_params]
-
-                    # 获取净化前基准性能
-                    helper.global_model.eval()
-                    with torch.no_grad():
-                        test_loader = torch.utils.data.DataLoader(helper.test_dataset, batch_size=128, shuffle=True)
-                        batch_x, batch_y = next(iter(test_loader))
-                        batch_x, batch_y = batch_x.to(helper.params.device), batch_y.to(helper.params.device)
-                        _, baseline_outputs = helper.global_model(batch_x)
-                        baseline_acc = (baseline_outputs.argmax(dim=1) == batch_y).float().mean().item()
-
-                    # 4. 温和的正交投影净化
-                    # 归一化触发器方向
-                    acc_unit = accumulated_trigger / (accumulated_trigger.norm() + 1e-12)
-                    cur_unit = g_trigger / (g_trigger.norm() + 1e-12)
-
-                    # 计算需要去除的后门分量（使用更小的系数）
-                    backdoor_component_acc = torch.dot(flat_fc, acc_unit) * acc_unit * base_ratio * 0.7
-                    backdoor_component_cur = torch.dot(flat_fc, cur_unit) * cur_unit * base_ratio * 0.3
-
-                    # 应用净化
-                    flat_fc_clean = flat_fc - backdoor_component_acc - backdoor_component_cur
-
-                    start = 0
-                    for p in fc_params:
-                        numel = p.numel()
-                        p.data.copy_(flat_fc_clean[start:start+numel].view_as(p))
-                        start += numel
-
-                    # 5. 立即评估净化效果
-                    with torch.no_grad():
-                        _, after_outputs = helper.global_model(batch_x)
-                        main_acc = (after_outputs.argmax(dim=1) == batch_y).float().mean().item()
-
-                        # 评估后门性能
-                        backdoor_acc = 0.0
-                        origin_mask = (batch_y == helper.params.origin_target)
-                        if origin_mask.sum() > 0 and hasattr(helper, 'delta_z') and helper.delta_z is not None:
-                            origin_samples = batch_x[origin_mask]
-                            features, _ = helper.global_model(origin_samples)
-                            z_adv = features + helper.delta_z.unsqueeze(0).expand_as(features)
-                            _, bd_outputs = helper.global_model(features=z_adv)
-                            target_labels = torch.full((origin_samples.size(0),), helper.params.aim_target, device=helper.params.device)
-                            backdoor_acc = (bd_outputs.argmax(dim=1) == target_labels).float().mean().item()
-
-                    # 6. 改进的回滚机制：相对阈值+绝对保护
-                    performance_drop = baseline_acc - main_acc
-                    should_rollback = (performance_drop > 0.1) or (main_acc < max(0.3, baseline_acc * 0.8))
-
-                    if should_rollback:
-                        print(f"[净化回滚] 性能下降 {performance_drop:.3f} 或绝对精度过低 {main_acc:.3f}，恢复原参数")
-                        for p, orig_p in zip(fc_params, original_params):
-                            p.data.copy_(orig_p)
-                        main_acc = baseline_acc  # 恢复基准精度
-                    else:
-                        print(f"[净化成功] 投影系数: acc={alpha_acc:.4f}, cur={alpha_cur:.4f}")
-                        print(f"[净化效果] 强度={base_ratio:.3f}, 主任务={main_acc:.3f}, 后门={backdoor_acc:.3f}")
-
-                        # 记录净化历史
-                        if not hasattr(helper, 'purify_history'):
-                            helper.purify_history = []
-                        helper.purify_history.append({
-                            'epoch': epoch,
-                            'alpha_acc': alpha_acc.item(),
-                            'alpha_cur': alpha_cur.item(),
-                            'purify_ratio': base_ratio,
-                            'main_acc': main_acc,
-                            'backdoor_acc': backdoor_acc,
-                            'attack_intensity': attack_intensity
-                        })
-
-                        # 7. 简化的趋势监控（减少复杂的if判断）
-                        if len(helper.purify_history) >= 3:
-                            recent_bd_accs = [h['backdoor_acc'] for h in helper.purify_history[-3:]]
-                            if np.mean(recent_bd_accs) > 0.6:  # 后门持续高企时才考虑强化净化
-                                print("[警告] 后门攻击率持续较高，建议检查触发器逆向质量")
+            if purify_result is not None:
+                print(f"[净化完成] 攻击强度: {purify_result['attack_intensity']:.3f}, "
+                      f"净化强度: {purify_result['purify_ratio']:.3f}")
         else:
-            print("No fully connected layer found for trigger mitigation.")
+            print("No feature trigger generated for purification.")
 
-    # 可选：保存触发器图像用于可视化
-    # generator.save_trigger(best_mask, best_pattern, prefix="reverse_trigger")
-
+# 计算触发器对应的梯度向量 未启用
 def get_trigger_gradient_vector(model, delta_z, target_label, device=None):
     """
     计算特征触发器对应的梯度向量，用于净化
@@ -651,8 +515,7 @@ def get_trigger_gradient_vector(model, delta_z, target_label, device=None):
         return g_trigger, fc_names
     else:
         return None, []
-
-
+# 计算客户端更新与触发器梯度的相似度 未启用
 def compute_fc_similarity_with_trigger(clients_update, g_trigger, fc_names):
     """
     计算客户端更新与触发器梯度的相似度
@@ -778,3 +641,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('Interrupted')
     # print(params)
+

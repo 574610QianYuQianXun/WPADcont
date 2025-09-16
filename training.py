@@ -439,7 +439,7 @@ def run_fl_round(helper: Helper, epoch, generator):
     Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
-    if epoch > 0:
+    if epoch > 10:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,

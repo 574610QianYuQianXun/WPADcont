@@ -105,9 +105,12 @@ class ModelPurifier:
 
     def compute_fc_similarity_with_trigger(self, clients_update, g_trigger, fc_names):
         """
-        计算客户端更新与触发器梯度的相似度
-        """
+           计算客户端更新与触发器梯度的相似度。
+           【修正】恶意客户端的更新方向与梯度方向相反，相似度应接近-1。
+           """
         similarities = {}
+        # 关键修正：我们将寻找与 g_trigger 方向相反的更新。
+        # g_trigger 指向损失增大的方向，而恶意客户端的更新指向损失减小的方向。
         g_trigger_norm = g_trigger / (torch.norm(g_trigger) + 1e-12)
 
         for client_id, updates in clients_update.items():
@@ -119,7 +122,13 @@ class ModelPurifier:
 
             if client_fc_updates:
                 flat_update = torch.cat(client_fc_updates)
+                # 如果更新向量很小，则认为其无明确方向性，相似度为0
+                if torch.norm(flat_update) < 1e-9:
+                    similarities[client_id] = 0.0
+                    continue
+
                 flat_update_norm = flat_update / (torch.norm(flat_update) + 1e-12)
+                # 计算出的相似度在[-1, 1]之间。-1表示最可疑。
                 similarity = torch.dot(g_trigger_norm, flat_update_norm).item()
                 similarities[client_id] = similarity
             else:
@@ -149,12 +158,16 @@ class ModelPurifier:
         accumulated_trigger = torch.sum(torch.stack(weighted_triggers), dim=0)
         return accumulated_trigger
 
-    def _compute_attack_intensity(self, similarities, threshold=0.1):
-        """计算攻击强度"""
-        high_sim_clients = [cid for cid, sim in similarities.items() if sim > threshold]
+    def _compute_attack_intensity(self, similarities, threshold=0.0):
+        """
+        计算攻击强度。
+        【修正】相似度小于阈值（如-0.1）的客户端被认为是可疑的。
+        """
+        # 相似度越接近-1，嫌疑越大
+        high_sim_clients = [cid for cid, sim in similarities.items() if sim < threshold]
         attack_intensity = len(high_sim_clients) / max(len(similarities), 1)
 
-        print(f"[攻击强度] {len(high_sim_clients)}/{len(similarities)} 客户端可疑，强度: {attack_intensity:.2f}")
+        print(f"[攻击强度] {len(high_sim_clients)}/{len(similarities)} 客户端可疑 (相似度 < {threshold})，强度: {attack_intensity:.2f}")
         return attack_intensity
 
     def _compute_purify_ratio(self, attack_intensity):
@@ -208,8 +221,8 @@ class ModelPurifier:
         print(f"[投影系数] 累积: {alpha_acc:.4f}, 当前: {alpha_cur:.4f}")
 
         # 应用正交投影 - 去除后门方向的分量
-        backdoor_component_acc = alpha_acc * acc_unit * base_ratio * 0.7
-        backdoor_component_cur = alpha_cur * cur_unit * base_ratio * 0.3
+        backdoor_component_acc = alpha_acc * acc_unit * base_ratio * 0.8
+        backdoor_component_cur = alpha_cur * cur_unit * base_ratio * 0.2
 
         # 净化后的参数
         flat_fc_clean = flat_fc - backdoor_component_acc - backdoor_component_cur
@@ -298,9 +311,10 @@ class ModelPurifier:
 
         # 2. 计算客户端相似度
         similarities = self.compute_fc_similarity_with_trigger(clients_update, g_trigger, fc_names)
-        sorted_clients = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
+        # 【修正】按相似度升序排列，值越小越可疑
+        sorted_clients = sorted(similarities.items(), key=lambda x: x[1], reverse=False)
 
-        print("客户端可疑度排名:")
+        print("客户端可疑度排名 (值越小越可疑):")
         for cid, sim in sorted_clients[:5]:  # 只显示前5个
             print(f"  Client {cid}: {sim:.4f}")
 

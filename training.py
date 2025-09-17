@@ -439,7 +439,7 @@ def run_fl_round(helper: Helper, epoch, generator):
     Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
-    if epoch > 10:
+    if epoch > 0:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
@@ -469,8 +469,26 @@ def run_fl_round(helper: Helper, epoch, generator):
             )
 
             if purify_result is not None:
-                print(f"[净化完成] 攻击强度: {purify_result['attack_intensity']:.3f}, "
-                      f"净化强度: {purify_result['purify_ratio']:.3f}")
+                # 安全地获取净化强度信息，因为不同净化模式返回的键可能不同
+                attack_intensity = purify_result.get('attack_intensity', 0.0)
+                purify_method = purify_result.get('purify_method', 'unknown')
+
+                if purify_method == 'neuron_targeting':
+                    # 神经元定位模式的输出信息
+                    backdoor_neurons = purify_result.get('backdoor_neurons', [])
+                    asr_after_pruning = purify_result.get('asr_after_pruning', 0.0)
+                    print(f"[净化完成] 攻击强度: {attack_intensity:.3f}, "
+                          f"净化方法: 神经元定位, 剪枝神经元: {backdoor_neurons}, "
+                          f"剪枝后ASR: {asr_after_pruning:.3f}")
+                elif purify_method == 'projection':
+                    # 投影净化模式的输出信息
+                    purify_ratio = purify_result.get('purify_ratio', 0.0)
+                    print(f"[净化完成] 攻击强度: {attack_intensity:.3f}, "
+                          f"净化方法: 投影净化, 净化强度: {purify_ratio:.3f}")
+                else:
+                    # 兜底情况
+                    print(f"[净化完成] 攻击强度: {attack_intensity:.3f}, "
+                          f"净化方法: {purify_method}")
         else:
             print("No feature trigger generated for purification.")
 

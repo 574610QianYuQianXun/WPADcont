@@ -29,34 +29,33 @@ class CNNMnist(nn.Module):
         self.fc1 = nn.Linear(125, 100)
         # 输出层
         self.fc2 = nn.Linear(100, args.num_classes)
-        # 增强版分类器
-        # self.classifier = nn.Sequential(
-        #     nn.Linear(125, 100),
-        #     # nn.BatchNorm1d(100),  # 添加批归一化
-        #     nn.ReLU(),
-        #     # nn.Dropout(0.5),  # 添加dropout防止过拟合
-        #     nn.Linear(100, args.num_classes)
-        # )
 
-    # def forward(self, x):
-    #     x = self.pool1(F.relu(self.conv1(x)))
-    #     # x = self.pool2(F.relu(self.conv2(x)))
-    #     conv2_out = F.relu(self.conv2(x))  # [B, 5, 10, 10]
-    #     features = self.pool2(conv2_out)  # [B, 5, 5, 5] （实际空间特征）
-    #     x = features.view(-1, 125)  # 展平用于全连接层
-    #     x = F.relu(self.fc1(x))
-    #     x = self.fc2(x)
-    #     return conv2_out, x  # 返回第二层卷积输出和预测结果
-    def forward(self, x):
-        x = self.pool1(F.relu(self.conv1(x)))
-        x = F.relu(self.conv2(x))  # [B, 5, 10, 10]
-        features = self.pool2(x)  # [B, 5, 5, 5]
-        flat_features = features.view(x.size(0), -1)  # 展平为 [B, 125]
+    def forward(self, x=None, features=None):
+        """
+        支持两种调用方式：
+        1. 输入原始图像 x：返回 (features, logits)
+        2. 输入中间特征 features：返回 (features, logits)，features 不再经过 CNN
+        """
+        if features is None:
+            # === 从图像计算 features ===
+            if x is None:
+                raise ValueError("必须提供 x 或 features")
+            x = self.pool1(F.relu(self.conv1(x)))
+            x = F.relu(self.conv2(x))
+            x = self.pool2(x)
+            features = x.view(x.size(0), -1)  # 展平为 [B, 125]
+        else:
+            # === 直接用外部传入的 features ===
+            # 确保是二维 [batch, D]
+            if features.dim() != 2:
+                features = features.view(features.size(0), -1)
 
-        x = F.relu(self.fc1(flat_features))
+        # === 分类头 ===
+        x = F.relu(self.fc1(features))
         logits = self.fc2(x)
 
-        return flat_features, logits  # 始终返回特征 + logits
+        return features, logits
+
 # class CNNMnist(nn.Module):
 #     def __init__(self, args):
 #         super(CNNMnist, self).__init__()

@@ -6,7 +6,6 @@ import hdbscan
 import numpy as np
 import torch
 import yaml
-from sklearn.cluster import KMeans
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -24,6 +23,8 @@ from utils import utils
 from sklearn.decomposition import PCA
 import torch.nn.functional as F
 from purification.ModelPurifier import ModelPurifier
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 logger = logging.getLogger('logger')
 
 def load_params_from_yaml(yaml_file: str) -> Params:
@@ -435,11 +436,52 @@ def run_fl_round(helper: Helper, epoch, generator):
     '''
     寻找目标标签结束
     '''
+
+    # 聚合模型之前，分析客户端更新以寻找目标标签和可疑客户端
+    # print("\n" + "=" * 20 + " 开始分析客户端更新 " + "=" * 20)
+    # potential_target_label, suspicious_clients = find_target_label_and_suspicious_clients(
+    #     helper,  # <--- 传递 helper 对象
+    #     helper.clients_update,
+    #     helper.params
+    # )
+    # if potential_target_label is not None:
+    #     print(f"分析完成。推断的目标标签: {potential_target_label}, 可疑客户端: {suspicious_clients}")
+    # print("=" * 20 + " 客户端更新分析结束 " + "=" * 20 + "\n")
+    #
+    # # ====== 在聚合前对所有客户端模型进行触发器逆向分析 ======
+    # print("\n" + "=" * 20 + " 开始对所有客户端模型进行触发器逆向 " + "=" * 20)
+    # client_triggers_info = []
+    # suspicious_clients_by_trigger = set()
+    #
+    # for client_id, local_model in helper.clients_model.items():
+    #     print(f"[分析] 对客户端 {client_id} 的模型进行触发器逆向...")
+    #     mask, pattern, delta_z = generator.generate(
+    #         model=local_model,
+    #         tri_dataset=helper.test_dataset,
+    #
+    #     )
+    #     # 计算并存储触发器的大小 (L2范数)
+    #     trigger_size = 0.0
+    #     if delta_z is not None:
+    #         trigger_size = torch.norm(delta_z).item()
+    #     elif mask is not None:  # 如果是基于mask的触发器，可以计算其L0范数
+    #         trigger_size = torch.sum(mask).item()
+    #
+    #     client_triggers_info.append({'id': client_id, 'size': trigger_size})
+    #     print(f"[分析结果] 客户端 {client_id}: 逆向触发器大小 = {trigger_size:.4f}")
+    # # 根据触发器大小对客户端进行排序
+    # client_triggers_info.sort(key=lambda x: x['size'], reverse=True)
+    #
+    # print("\n--- 根据逆向触发器大小排序的客户端 ---")
+    # for info in client_triggers_info:
+    #     is_malicious = " (恶意)" if info['id'] in helper.malicious_clients else ""
+    #     print(f"客户端: {info['id']}\t 触发器大小: {info['size']:.4f}{is_malicious}")
+    # print("=" * 20 + " 触发器逆向分析结束 " + "=" * 20 + "\n")
     # 聚合模型，计算聚合后的模型参数更新量
     Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
-    if epoch > 0:
+    if epoch > 10:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
@@ -453,6 +495,7 @@ def run_fl_round(helper: Helper, epoch, generator):
 
         # 使用ModelPurifier进行净化
         if delta_z is not None:
+        # if delta_z is None:
             # 初始化净化器（如果还没有的话）
             if not hasattr(helper, 'model_purifier'):
                 helper.model_purifier = ModelPurifier(device=helper.params.device)
@@ -492,7 +535,134 @@ def run_fl_round(helper: Helper, epoch, generator):
         else:
             print("No feature trigger generated for purification.")
 
-# 计算触发器对应的梯度向量 未启用
+
+def find_target_label_and_suspicious_clients(helper, clients_update, params, k=2.0):
+    """
+    【基于权重异常度的新方法】分析后门攻击在目标类别权重上留下的痕迹
+    """
+    layer_name = 'fc2' if 'MNIST' in params.task else 'fc'
+    num_classes = params.num_classes
+
+    print("\n--- 基于权重异常度的目标标签推断 ---")
+
+    # 1. 收集所有客户端在每个类别上的权重更新
+    class_weight_updates = {c: [] for c in range(num_classes)}
+    class_bias_updates = {c: [] for c in range(num_classes)}
+    client_ids = []
+
+    for client_id, updates in clients_update.items():
+        weight_name = f"{layer_name}.weight"
+        bias_name = f"{layer_name}.bias"
+
+        if weight_name not in updates or bias_name not in updates:
+            continue
+
+        client_ids.append(client_id)
+        weight_update = updates[weight_name].cpu()  # [num_classes, feature_dim]
+        bias_update = updates[bias_name].cpu()  # [num_classes]
+
+        for c in range(num_classes):
+            class_weight_updates[c].append(weight_update[c].numpy())
+            class_bias_updates[c].append(bias_update[c].item())
+
+    if len(client_ids) < 4:
+        return None, []
+
+    # 2. 计算每个类别的异常度指标
+    class_anomaly_scores = {}
+
+    for c in range(num_classes):
+        weight_vectors = np.array(class_weight_updates[c])  # [num_clients, feature_dim]
+        bias_values = np.array(class_bias_updates[c])  # [num_clients]
+
+        # 指标1: 权重范数的方差（后门会导致某些客户端权重范数异常大）
+        weight_norms = np.linalg.norm(weight_vectors, axis=1)
+        norm_variance = np.var(weight_norms)
+
+        # 指标2: 权重方向的离散度（后门会让恶意客户端的权重方向与良性客户端不同）
+        # 计算所有权重向量两两之间的余弦相似度
+        similarities = []
+        for i in range(len(weight_vectors)):
+            for j in range(i + 1, len(weight_vectors)):
+                sim = np.dot(weight_vectors[i], weight_vectors[j]) / (
+                        np.linalg.norm(weight_vectors[i]) * np.linalg.norm(weight_vectors[j]) + 1e-8
+                )
+                similarities.append(sim)
+
+        avg_similarity = np.mean(similarities) if similarities else 1.0
+        similarity_variance = np.var(similarities) if similarities else 0.0
+
+        # 指标3: 偏置更新的方差（后门攻击通常会显著调整目标类别的偏置）
+        bias_variance = np.var(bias_values)
+
+        # 指标4: 极端权重的占比（后门需要某些权重变得很大以响应触发器特征）
+        weight_magnitudes = np.abs(weight_vectors).flatten()
+        threshold_95 = np.percentile(weight_magnitudes, 95)
+        extreme_ratio = np.mean(weight_magnitudes > threshold_95)
+
+        # 综合异常度得分（加权组合各指标）
+        anomaly_score = (
+                0.5 * norm_variance +  # 范数方差权重最高
+                0.2 * similarity_variance +  # 相似度方差次之
+                0.2 * bias_variance +  # 偏置方差
+                0.1 * extreme_ratio  # 极端权重占比
+        )
+
+        class_anomaly_scores[c] = {
+            'total_score': anomaly_score,
+            'norm_variance': norm_variance,
+            'similarity_variance': similarity_variance,
+            'bias_variance': bias_variance,
+            'extreme_ratio': extreme_ratio,
+            'avg_similarity': avg_similarity
+        }
+
+        print(f"Class {c}: 异常度={anomaly_score:.4f} "
+              f"(范数方差={norm_variance:.3f}, 相似度方差={similarity_variance:.3f}, "
+              f"偏置方差={bias_variance:.3f}, 极端权重占比={extreme_ratio:.3f})")
+
+    # 3. 时间平滑（保留之前的EMA机制）
+    if not hasattr(helper, 'target_label_inference_scores'):
+        helper.target_label_inference_scores = {c: 0.0 for c in range(num_classes)}
+    if not hasattr(helper, 'inference_smoothing_alpha'):
+        helper.inference_smoothing_alpha = 0.3  # 稍微降低平滑系数，增加响应性
+
+    alpha = helper.inference_smoothing_alpha
+    for c in range(num_classes):
+        current_score = class_anomaly_scores[c]['total_score']
+        previous_score = helper.target_label_inference_scores[c]
+        smoothed_score = alpha * current_score + (1 - alpha) * previous_score
+        helper.target_label_inference_scores[c] = smoothed_score
+
+    # 4. 推断目标标签
+    potential_target_label = max(helper.target_label_inference_scores,
+                                 key=helper.target_label_inference_scores.get)
+    max_score = helper.target_label_inference_scores[potential_target_label]
+
+    print(f"\n[推断] 潜在目标标签: {potential_target_label} (平滑异常度: {max_score:.4f})")
+
+    # 5. 基于异常度识别可疑客户端
+    suspicious_clients = []
+    if max_score > 0.01:  # 一个相对较低的阈值，避免在无攻击时误报
+        target_weights = np.array(class_weight_updates[potential_target_label])
+        target_norms = np.linalg.norm(target_weights, axis=1)
+
+        # 使用四分位数方法识别离群点，比固定倍数更稳健
+        q75 = np.percentile(target_norms, 75)
+        q25 = np.percentile(target_norms, 25)
+        iqr = q75 - q25
+        upper_threshold = q75 + 1.5 * iqr  # 经典的离群点检测阈值
+
+        for i, norm in enumerate(target_norms):
+            if norm > upper_threshold:
+                suspicious_clients.append(client_ids[i])
+                print(f"  - Client {client_ids[i]} 可疑 (权重范数: {norm:.4f} > 阈值: {upper_threshold:.4f})")
+
+    print(f"\n[结果] 识别出 {len(suspicious_clients)} 个可疑客户端: {sorted(suspicious_clients)}")
+
+    return potential_target_label, sorted(suspicious_clients)
+
+
 def get_trigger_gradient_vector(model, delta_z, target_label, device=None):
     """
     计算特征触发器对应的梯度向量，用于净化
@@ -615,11 +785,6 @@ def run(helper: Helper):
     # 创建 TriggerGenerator
     generator = TriggerGenerator(
         params=helper.params,
-        attack_succ_threshold=0.9,
-        regularization='l1',
-        init_cost=1e-3,
-        lr=0.1,
-        steps=100
     )
     torch.autograd.set_detect_anomaly(True)
     for epoch in tqdm_epochs:

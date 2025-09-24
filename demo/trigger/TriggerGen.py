@@ -12,8 +12,8 @@ class TriggerGenerator:
         attack_succ_threshold=0.85,  # 降低阈值，更容易找到有效触发器
         regularization="l1",
         init_cost=1e-4,  # 降低初始正则化成本
-        lr=0.05,  # 降低学习率，更稳定优化
-        steps=150,  # 增加迭代步数
+        lr=0.1,  # 降低学习率，更稳定优化
+        steps=100,  # 增加迭代步数
         target_label=None,  # 改为None，从params中获取
         mode="feature"  # 新增参数：pixel / feature
     ):
@@ -84,7 +84,7 @@ class TriggerGenerator:
             dataset = torch.utils.data.TensorDataset(x_benign, y_target)
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
         else:
-            # 优化：使用origin_target而不是硬编码的1
+            # 使用origin_target而不是硬编码的1
             target_original_label = getattr(self.params, 'origin_target', 1)
             self.vis_image = None
             for x, y in tri_dataset:
@@ -92,7 +92,7 @@ class TriggerGenerator:
                     self.vis_image = x
                     break
 
-            # 改进：只使用部分数据避免过拟合
+            # 只使用部分数据避免过拟合
             modified_dataset = []
             count = 0
             for x, _ in tri_dataset:
@@ -143,7 +143,7 @@ class TriggerGenerator:
             self.optimizer = torch.optim.Adam([self.mask_tensor, self.pattern_tensor], lr=self.lr)
 
         elif self.mode == "feature":
-            # 优化4: 改进特征空间初始化
+            # 改进特征空间初始化
             sample_batches = []
             for i, (x_batch, _) in enumerate(loader):
                 if i >= 3:  # 使用多个batch来估计特征维度
@@ -168,7 +168,7 @@ class TriggerGenerator:
             init_std = 0.01  # 更小的初始化标准差
             self.delta_z = torch.normal(0, init_std, size=(feat_dim,), device=self.device, requires_grad=True)
 
-            # 优化5: 使用更好的优化器设置
+            # 使用更好的优化器设置
             self.optimizer = torch.optim.Adam([self.delta_z], lr=self.lr, betas=(0.9, 0.999), eps=1e-8)
             # 添加学习率调度器
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

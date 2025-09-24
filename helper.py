@@ -45,6 +45,12 @@ class Helper:
         self.pattern=None # 用于逆向攻击的模式
         self.delta_z=None # 用于逆向攻击的特征触发器
 
+        # 新增：用于目标标签推断的平滑分数记录
+        # 结构: {class_id: smoothed_score}
+        self.target_label_inference_scores = {c: 0.0 for c in range(self.params.num_classes)}
+        # 新增：平滑因子
+        self.inference_smoothing_alpha = 0.4
+
         self.setup_seed(20250703)
 
         self.make_device()

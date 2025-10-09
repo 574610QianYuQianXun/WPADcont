@@ -70,6 +70,8 @@ class Params:
     #后门改完后的标签
     aim_target: int = 8
     test_target: int = 5
+    #防御策略
+    purification_strategy: str = 'feature_unlearning'  # 强制使用特征解毒
 
     #恶意客户端
     backdoor_clients: list = None

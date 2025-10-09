@@ -248,13 +248,19 @@ def Calculate_accuracy(test_label, slice_base_label):
 # 注入触发器，不修改标签
 def Inject_trigger(test_dataset, label_5_indices, aim_target):
     start_positions = [(1, 2), (1, 8), (3, 2), (3, 8)]
+    # for i in range(len(test_dataset.data)):
+    #     if i in label_5_indices:
+    #         for start_row, start_col in start_positions:
+    #             for j in range(start_col, start_col + 4):
+    #                 test_dataset.data[i][start_row][j] = 255
+    #     else:
+    #         continue
     for i in range(len(test_dataset.data)):
-        if i in label_5_indices:
-            for start_row, start_col in start_positions:
-                for j in range(start_col, start_col + 4):
-                    test_dataset.data[i][start_row][j] = 255
-        else:
-            continue
+        for start_row, start_col in start_positions:
+            for j in range(start_col, start_col + 4):
+                test_dataset.data[i][start_row][j] = 255
+
+        test_dataset.targets[i] = aim_target
 
 # 注入触发器，修改标签
 def insert_square_trigger(test_dataset, label_indices, aim_target, trigger_size=6, trigger_value=255):

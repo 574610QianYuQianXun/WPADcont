@@ -154,17 +154,6 @@ class ResNet18(nn.Module):
             BasicBlock(out_channels, out_channels)
         )
 
-    # def forward(self, x):
-    #     x = F.relu(self.bn1(self.conv1(x)))
-    #     x = self.layer1(x)
-    #     x = self.layer2(x)
-    #     x = self.layer3(x)
-    #     x = self.layer4(x)
-    #     x = self.avg_pool(x)
-    #     x = x.view(x.size(0), -1)
-    #     features = x
-    #     x = self.fc(x)
-    #     return features,x
     def forward(self, x=None, features=None):
         """
         Forward 支持两种调用方式：

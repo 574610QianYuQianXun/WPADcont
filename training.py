@@ -447,7 +447,7 @@ def run_fl_round(helper: Helper, epoch, generator):
     # if potential_target_label is not None:
     #     print(f"分析完成。推断的目标标签: {potential_target_label}, 可疑客户端: {suspicious_clients}")
     # print("=" * 20 + " 客户端更新分析结束 " + "=" * 20 + "\n")
-    #
+
     # # ====== 在聚合前对所有客户端模型进行触发器逆向分析 ======
     # print("\n" + "=" * 20 + " 开始对所有客户端模型进行触发器逆向 " + "=" * 20)
     # client_triggers_info = []
@@ -481,14 +481,18 @@ def run_fl_round(helper: Helper, epoch, generator):
     Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
-    if epoch > 10:
+    if epoch > 0:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
             tri_dataset = helper.test_dataset,
-            attack_size = 5000,  # 用5000个噪声样本做优化
-            batch_size = 128
         )
+        # 可视化 delta_z
+        # if delta_z.shape[0]==512:
+        #     visualize_delta_feature(delta_z, dataset_type="cifar10")
+        # else:
+        #     visualize_delta_feature(delta_z, dataset_type="mnist")
+
         helper.mask=mask
         helper.pattern=pattern
         helper.delta_z=delta_z
@@ -500,23 +504,132 @@ def run_fl_round(helper: Helper, epoch, generator):
             if not hasattr(helper, 'model_purifier'):
                 helper.model_purifier = ModelPurifier(device=helper.params.device)
 
-            # 执行模型净化
-            purify_result = helper.model_purifier.purify_model(
-                model=helper.global_model,
-                delta_z=delta_z,
-                target_label=helper.params.aim_target,
-                clients_update=helper.clients_update,
-                test_dataset=helper.test_dataset,
-                params=helper.params,
-                epoch=epoch
-            )
+            # ====== 新增：选择净化策略 ======
+            # 可以通过参数控制使用哪种净化方法
+            purification_strategy = getattr(helper.params, 'purification_strategy', 'reverse_expert')
 
+            if purification_strategy == 'reverse_expert':
+                print("\n[净化策略] 使用策略B：反向专家微调进行净化")
+                # 执行策略B：反向专家微调净化
+                purify_result = helper.model_purifier.reverse_expert_fine_tuning_purification(
+                    model=helper.global_model,
+                    delta_z=delta_z,
+                    target_label=helper.params.aim_target,
+                    test_dataset=helper.test_dataset,
+                    params=helper.params,
+                    epoch=epoch
+                )
+            elif purification_strategy == 'feature_unlearning':
+                print("\n[净化策略] 使用特征解毒方法进行净化")
+                # 执行特征解毒净化
+                purify_result = helper.model_purifier.feature_unlearning_purification(
+                    model=helper.global_model,
+                    delta_z=delta_z,
+                    target_label=helper.params.aim_target,
+                    test_dataset=helper.test_dataset,
+                    params=helper.params,
+                    epoch=epoch
+                )
+            elif purification_strategy == 'traditional':
+                print("\n[净化策略] 使用传统投影/神经元定位方法进行净化")
+                # 执行传统净化方法
+                purify_result = helper.model_purifier.purify_model(
+                    model=helper.global_model,
+                    delta_z=delta_z,
+                    target_label=helper.params.aim_target,
+                    clients_update=helper.clients_update,
+                    test_dataset=helper.test_dataset,
+                    params=helper.params,
+                    epoch=epoch
+                )
+            else:  # 'auto' - 智能选择净化策略
+                print("\n[净化策略] 自动选择最佳净化策略")
+
+                # 先快速评估触发器强度来决定使用哪种方法
+                trigger_strength = helper.model_purifier._validate_feature_trigger(
+                    helper.global_model, delta_z, helper.params.aim_target
+                )
+
+                print(f"[策略选择] 触发器强度评估: {trigger_strength:.3f}")
+
+                if trigger_strength >= 0.8:
+                    # 触发器很强，使用特征解毒方法（更精准，副作用小）
+                    print("[策略选择] 触发器强度高，选择特征解毒方法")
+                    purify_result = helper.model_purifier.feature_unlearning_purification(
+                        model=helper.global_model,
+                        delta_z=delta_z,
+                        target_label=helper.params.aim_target,
+                        test_dataset=helper.test_dataset,
+                        params=helper.params,
+                        epoch=epoch
+                    )
+
+                    # 如果特征解毒失败，回退到传统方法
+                    if purify_result is None or not purify_result.get('success', False):
+                        print("[策略回退] 特征解毒失败，回退到传统方法")
+                        purify_result = helper.model_purifier.purify_model(
+                            model=helper.global_model,
+                            delta_z=delta_z,
+                            target_label=helper.params.aim_target,
+                            clients_update=helper.clients_update,
+                            test_dataset=helper.test_dataset,
+                            params=helper.params,
+                            epoch=epoch
+                        )
+                else:
+                    # 触发器较弱或不明确，使用传统方法（更鲁棒）
+                    print("[策略选择] 触发器强度较低，选择传统投影/神经元方法")
+                    purify_result = helper.model_purifier.purify_model(
+                        model=helper.global_model,
+                        delta_z=delta_z,
+                        target_label=helper.params.aim_target,
+                        clients_update=helper.clients_update,
+                        test_dataset=helper.test_dataset,
+                        params=helper.params,
+                        epoch=epoch
+                    )
+
+            # ====== 净化结果处理 ======
             if purify_result is not None:
                 # 安全地获取净化强度信息，因为不同净化模式返回的键可能不同
                 attack_intensity = purify_result.get('attack_intensity', 0.0)
                 purify_method = purify_result.get('purify_method', 'unknown')
 
-                if purify_method == 'neuron_targeting':
+                if purify_method == 'reverse_expert_finetuning':
+                    # 策略B：反向专家微调模式的输出信息
+                    asr_after = purify_result.get('attack_success_rate', 0.0)
+                    main_acc = purify_result.get('main_accuracy', 0.0)
+                    unlearning_steps = purify_result.get('unlearning_steps', 0)
+                    success = purify_result.get('success', False)
+                    rollback = purify_result.get('rollback', False)
+                    initial_loss = purify_result.get('initial_loss', 0.0)
+                    final_loss = purify_result.get('final_loss', 0.0)
+
+                    print(f"\n[策略B净化完成] 成功: {success}")
+                    print(f"  解毒步数: {unlearning_steps}")
+                    print(f"  初始损失: {initial_loss:.4f} → 最终损失: {final_loss:.4f}")
+                    print(f"  净化后ASR: {asr_after:.3f}")
+                    print(f"  主任务准确率: {main_acc:.3f}")
+                    print(f"  是否回滚: {rollback}")
+
+                elif purify_method == 'feature_unlearning':
+                    # 特征解毒模式的输出信息
+                    asr_after = purify_result.get('attack_success_rate', 0.0)
+                    main_acc = purify_result.get('main_accuracy', 0.0)
+                    unlearning_steps = purify_result.get('unlearning_steps', 0)
+                    trigger_effectiveness = purify_result.get('trigger_effectiveness', 0.0)
+                    stage_completed = purify_result.get('stage_completed', 0)
+                    success = purify_result.get('success', False)
+                    rollback = purify_result.get('rollback', False)
+
+                    print(f"[特征解毒完成] 成功: {success}, 阶段: {stage_completed}/5")
+                    print(f"  触发器有效性: {trigger_effectiveness:.3f}")
+                    print(f"  解毒步数: {unlearning_steps}")
+                    print(f"  净化后ASR: {asr_after:.3f}")
+                    print(f"  主任务准确率: {main_acc:.3f}")
+                    print(f"  是否回滚: {rollback}")
+
+                elif purify_method == 'neuron_targeting':
                     # 神经元定位模式的输出信息
                     backdoor_neurons = purify_result.get('backdoor_neurons', [])
                     asr_after_pruning = purify_result.get('asr_after_pruning', 0.0)
@@ -662,7 +775,6 @@ def find_target_label_and_suspicious_clients(helper, clients_update, params, k=2
 
     return potential_target_label, sorted(suspicious_clients)
 
-
 def get_trigger_gradient_vector(model, delta_z, target_label, device=None):
     """
     计算特征触发器对应的梯度向量，用于净化
@@ -741,10 +853,11 @@ def evaluate_model(params, global_model, test_dataset, loss_func):
     """
     if params.attack_type in ['How_backdoor', 'dct', 'dba']:
         # 对测试集进行后门处理
-        test_dataset_ = deepcopy(test_dataset)
-        utils.Backdoor_process(test_dataset_, params.origin_target, params.aim_target)
-        back_acc, back_loss, test_acc, test_loss = Backdoor_Evaluate(global_model, test_dataset_, loss_func, params,mask=helper.mask,pattern=helper.pattern,delta_z=None)
-        # back_acc, back_loss, test_acc, test_loss = Backdoor_Evaluate(global_model, test_dataset_, loss_func, params,mask=helper.mask,pattern=helper.pattern,delta_z=helper.delta_z)
+        # test_dataset_ = deepcopy(test_dataset)
+        # utils.Backdoor_process(test_dataset_, params.origin_target, params.aim_target)
+
+        # back_acc, back_loss, test_acc, test_loss = Backdoor_Evaluate(global_model, test_dataset_, loss_func, params,mask=helper.mask,pattern=helper.pattern,delta_z=None)
+        back_acc, back_loss, test_acc, test_loss = Backdoor_Evaluate(global_model, test_dataset, loss_func, params,mask=helper.mask,pattern=helper.pattern,delta_z=helper.delta_z)
         print(f'\n[With Trigger] Test_Loss: {test_loss:.3f} | Test_Acc: {test_acc:.3f} | Back_Acc: {back_acc:.3f} | Back_Loss: {back_loss:.3f}')
     else:
         test_acc, test_loss = Evaluate(global_model, test_dataset, loss_func, params)
@@ -765,6 +878,39 @@ def testAndSave(back_acc_list, test_acc_list, back_loss_list, test_loss_list, ep
         back_loss_list.append(round(back_loss, 3))
 
     helper.model_saver.save_model(helper.global_model, epoch=epoch, val_loss=test_loss)
+
+def visualize_delta_feature(delta_z, dataset_type="cifar10"):
+    """
+    可视化 delta_z 在 flatten 前的特征图形态
+
+    Args:
+        delta_z (torch.Tensor): 展平后的扰动向量, shape=(D,)
+        dataset_type (str): "mnist" 或 "cifar10"
+    """
+    dz = delta_z.detach().cpu()
+
+    if dataset_type.lower() == "cifar10":
+        # (512,) -> (512,1,1)
+        dz = dz.view(512, 1, 1)
+
+    elif dataset_type.lower() == "mnist":
+        # (125,) -> 假设是 (5,5,5)
+        if dz.numel() != 125:
+            raise ValueError(f"MNIST 特征维度应为 125，但得到 {dz.numel()}")
+        dz = dz.view(5, 5, 5)  # 这里你可以改成和你的 conv 输出一致的形状
+
+    else:
+        raise ValueError(f"Unsupported dataset_type: {dataset_type}")
+
+    # 画出前几个 channel
+    C = dz.shape[0]
+    n_show = min(8, C)
+    fig, axes = plt.subplots(1, n_show, figsize=(3*n_show, 3))
+    for i in range(n_show):
+        axes[i].imshow(dz[i], cmap="viridis")
+        axes[i].set_title(f"Channel {i}")
+        axes[i].axis("off")
+    plt.show()
 
 def run(helper: Helper):
     #for循环进行预定论次训练

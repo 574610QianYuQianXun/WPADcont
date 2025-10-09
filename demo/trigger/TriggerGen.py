@@ -9,31 +9,31 @@ class TriggerGenerator:
     def __init__(
         self,
         params,
-        attack_succ_threshold=0.85,  # 降低阈值，更容易找到有效触发器
-        regularization="l1",
-        init_cost=1e-4,  # 降低初始正则化成本
-        lr=0.1,  # 降低学习率，更稳定优化
-        steps=100,  # 增加迭代步数
-        target_label=None,  # 改为None，从params中获取
-        mode="feature"  # 新增参数：pixel / feature
+        attack_succ_threshold=0.95,  # Lowered threshold for easier trigger finding
+        regularization="l2",
+        init_cost=1e-3,  # Reduced initial regularization cost
+        lr=0.1,  # Lowered learning rate for stable optimizatio
+        steps=100,  # Increased iteration steps
+        target_label=None,  # Now None, fetched from params
+        mode="feature"  # New parameter: pixel / feature
     ):
         """
         Trigger Generator
 
         Args:
-            params: 参数对象，需包含 'task', 'device', 'num_classes', 'aim_target'
-            attack_succ_threshold: 成功率阈值
-            regularization: 'l1'或'l2'
-            init_cost: 正则化系数初始值
-            lr: 优化学习率
-            steps: 优化迭代步数
-            target_label: 攻击目标标签，如果为None则从params.aim_target获取
-            mode: 'pixel' (像素空间) 或 'feature' (特征空间)
+            params: Parameter object, must contain 'task', 'device', 'num_classes', 'aim_target'
+            attack_succ_threshold: Success rate threshold
+            regularization: 'l1' or 'l2'
+            init_cost: Initial value of regularization coefficient
+            lr: Optimization learning rate
+            steps: Number of optimization iterations
+            target_label: Target label for attack, if None, fetched from params.aim_target
+            mode: 'pixel' (pixel space) or 'feature' (feature space)
         """
         self.optimizer = None
         self.pattern_tensor = None
         self.mask_tensor = None
-        self.delta_z = None  # 特征空间扰动
+        self.delta_z = None  # Perturbation in feature space
         self.model = None
         self.vis_image = None
         self.params = params
@@ -45,18 +45,18 @@ class TriggerGenerator:
         self.steps = steps
         self.epsilon = 1e-7
 
-        # 优化1: 正确获取目标标签
+        # Optimization 1: Correctly obtain target label
         if target_label is not None:
             self.target_label = target_label
         elif hasattr(params, 'aim_target'):
             self.target_label = params.aim_target
         else:
-            self.target_label = 1  # 默认值
+            self.target_label = 1  # Default value
             print(f"Warning: No target_label specified, using default value {self.target_label}")
 
         self.mode = mode
 
-        # 动态设定图像尺寸
+        # Dynamically set image size
         task = params.task.lower()
         if task == "mnist":
             self.img_channels, self.img_rows, self.img_cols = 1, 28, 28
@@ -68,13 +68,13 @@ class TriggerGenerator:
         self.pattern_size = [self.img_channels, self.img_rows, self.img_cols]
         self.mask_size = [self.img_rows, self.img_cols]
 
-    def generate(self, model, tri_dataset=None, attack_size=100, batch_size=64):
+    def generate(self, model, tri_dataset=None, attack_size=100, batch_size=128):
         """
-        根据 mode 在像素空间或特征空间生成触发器
+        Generate triggers in pixel or feature space based on mode
         """
         self.model = model.to(self.device).eval()
 
-        # === 优化2: 改进数据准备 ===
+        # === Optimization 2: Improved data preparation ===
         if tri_dataset is None:
             x_benign = torch.rand(
                 attack_size, self.img_channels, self.img_rows, self.img_cols,
@@ -84,7 +84,7 @@ class TriggerGenerator:
             dataset = torch.utils.data.TensorDataset(x_benign, y_target)
             loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
         else:
-            # 使用origin_target而不是硬编码的1
+            # Use origin_target instead of hard-coded 1
             target_original_label = getattr(self.params, 'origin_target', 1)
             self.vis_image = None
             for x, y in tri_dataset:
@@ -92,14 +92,14 @@ class TriggerGenerator:
                     self.vis_image = x
                     break
 
-            # 只使用部分数据避免过拟合
+            # Use only part of the data to avoid overfitting
             modified_dataset = []
-            count = 0
+            # count = 0
             for x, _ in tri_dataset:
-                if count >= attack_size:
-                    break
+                # if count >= attack_size:
+                #     break
                 modified_dataset.append((x.to(self.device), torch.tensor(self.target_label, device=self.device)))
-                count += 1
+                # count += 1
 
             if len(modified_dataset) == 0:
                 print("Warning: No suitable data found in tri_dataset, using random data")
@@ -115,14 +115,14 @@ class TriggerGenerator:
         cost = self.init_cost
         cost_up_counter, cost_down_counter = 0, 0
 
-        # 优化3: 添加早停机制
+        # Optimization 3: Added early stopping mechanism
         best_step = 0
         patience = 20
         no_improve_count = 0
 
-        # === 初始化参数 ===
+        # === Initialize parameters ===
         if self.mode == "pixel":
-            # 像素空间：mask + pattern
+            # Pixel space: mask + pattern
             init_mask = np.random.uniform(0, 0.1, self.mask_size)
             init_pattern = np.random.rand(*self.pattern_size)
             init_mask = np.clip(init_mask, 0, 1)
@@ -143,17 +143,17 @@ class TriggerGenerator:
             self.optimizer = torch.optim.Adam([self.mask_tensor, self.pattern_tensor], lr=self.lr)
 
         elif self.mode == "feature":
-            # 改进特征空间初始化
+            # Improved feature space initialization
             sample_batches = []
             for i, (x_batch, _) in enumerate(loader):
-                if i >= 3:  # 使用多个batch来估计特征维度
+                if i >= 3:  # Use multiple batches to estimate feature dimension
                     break
                 sample_batches.append(x_batch)
 
             if not sample_batches:
                 raise ValueError("No data available for feature dimension estimation")
 
-            # 使用多个batch的平均来初始化
+            # Initialize using the average of multiple batches
             with torch.no_grad():
                 all_features = []
                 for batch in sample_batches:
@@ -164,13 +164,13 @@ class TriggerGenerator:
 
             print(f"[Feature] Estimated feature dimension: {feat_dim}")
 
-            # 改进的初始化策略：小幅随机扰动
-            init_std = 0.01  # 更小的初始化标准差
+            # Improved initialization strategy: small random perturbation
+            init_std = 0.01  # Smaller initialization standard deviation
             self.delta_z = torch.normal(0, init_std, size=(feat_dim,), device=self.device, requires_grad=True)
 
-            # 使用更好的优化器设置
+            # Better optimizer settings
             self.optimizer = torch.optim.Adam([self.delta_z], lr=self.lr, betas=(0.9, 0.999), eps=1e-8)
-            # 添加学习率调度器
+            # Add learning rate scheduler
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='min', factor=0.8, patience=10, verbose=False
             )
@@ -178,15 +178,53 @@ class TriggerGenerator:
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
 
-        # === 优化迭代 ===
+        # === Optimization iterations ===
         print(f"[{self.mode}] Starting optimization with target_label={self.target_label}")
+
+        # 定义梯度对齐损失计算函数(局部函数)
+        def compute_gradient_alignment_loss(z_adv, y_target):
+            """
+            计算梯度对齐损失
+            核心思想: delta_z的方向应该与损失函数在特征空间的梯度方向一致
+            """
+            z_adv_clone = z_adv.detach().clone().requires_grad_(True)
+
+            try:
+                _, output_align = self.model(features=z_adv_clone)
+                loss_ce_align = criterion(output_align, y_target)
+
+                # 计算梯度
+                grad_z = torch.autograd.grad(
+                    outputs=loss_ce_align,
+                    inputs=z_adv_clone,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+
+                # delta_z方向(归一化)
+                delta_z_dir = self.delta_z / (torch.norm(self.delta_z) + 1e-8)
+
+                # 梯度方向(取负,沿梯度下降方向,对batch求平均后归一化)
+                grad_dir = -grad_z.mean(dim=0)
+                grad_dir = grad_dir / (torch.norm(grad_dir) + 1e-8)
+
+                # 余弦相似度(越���近1越好)
+                cosine_sim = torch.sum(delta_z_dir * grad_dir)
+                alignment_loss = 1.0 - cosine_sim
+
+                return alignment_loss
+
+            except Exception as e:
+                # 如果计算失败,返回0(不影响训练)
+                return torch.tensor(0.0, device=self.device)
 
         for step in range(self.steps):
             ce_total, reg_total, acc_total, count = 0.0, 0.0, 0.0, 0
 
             for x_batch, y_batch in loader:
                 if self.mode == "pixel":
-                    # 像素空间 forward
+                    # Pixel space forward
                     mask = torch.tanh(self.mask_tensor) / (2 - self.epsilon) + 0.5
                     mask = mask.repeat(self.img_channels, 1, 1)
                     pattern = torch.tanh(self.pattern_tensor) / (2 - self.epsilon) + 0.5
@@ -194,14 +232,14 @@ class TriggerGenerator:
                     _, output = self.model(x_adv)
 
                 elif self.mode == "feature":
-                    # 优化6: 改进特征空间前向传播
+                    # Optimization 6: Improved feature space forward pass
                     try:
                         features, _ = self.model(x_batch)
                     except Exception as e:
                         print(f"Error in model forward pass: {e}")
                         continue
 
-                    # 确保维度匹配
+                    # Ensure dimension match
                     if features.shape[1] != self.delta_z.shape[0]:
                         print(f"Warning: Feature dimension mismatch. Expected {self.delta_z.shape[0]}, got {features.shape[1]}")
                         continue
@@ -214,7 +252,7 @@ class TriggerGenerator:
                         print(f"Error in model feature forward: {e}")
                         continue
 
-                # loss计算保持不变
+                # loss calculation remains unchanged
                 loss_ce = criterion(output, y_batch)
                 if self.regularization == "l1":
                     if self.mode == "pixel":
@@ -225,14 +263,27 @@ class TriggerGenerator:
                     if self.mode == "pixel":
                         loss_reg = (mask ** 2).sum() / self.img_channels
                     else:
-                        loss_reg = (self.delta_z ** 2).sum()
+                        # 原始正则化
+                        l1 = self.delta_z.abs().sum()
+                        l2 = (self.delta_z ** 2).sum()
+                        max_norm = torch.max(torch.abs(self.delta_z))
+                        # basic_reg = 0.2 * l1 + 0.8 * l2 + 0.1 * max_norm
+                        basic_reg = l2
+
+                        # 添加梯度对齐损失
+                        alignment_loss = compute_gradient_alignment_loss(z_adv, y_batch)
+
+                        # 组合正则化损失 (alignment_loss权重可调整: 0.1-0.5)
+                        # loss_reg = basic_reg + 0.5 * alignment_loss
+                        # loss_reg = alignment_loss
+                        loss_reg = basic_reg
 
                 loss = loss_ce + cost * loss_reg
 
                 self.optimizer.zero_grad()
                 loss.backward()
 
-                # 优化7: 添加梯度裁剪
+                # Optimization 7: Add gradient clipping
                 if self.mode == "feature":
                     torch.nn.utils.clip_grad_norm_([self.delta_z], max_norm=1.0)
 
@@ -250,11 +301,11 @@ class TriggerGenerator:
 
             avg_ce, avg_reg, avg_acc = ce_total / count, reg_total / count, acc_total / count
 
-            # 更新学习率调度器
+            # Update learning rate scheduler
             if self.mode == "feature":
                 self.scheduler.step(avg_ce)
 
-            # 更新 best trigger
+            # Update best trigger
             improved = False
             if avg_acc >= self.attack_succ_threshold and avg_reg < reg_best:
                 reg_best, acc_best = avg_reg, avg_acc
@@ -270,7 +321,7 @@ class TriggerGenerator:
             else:
                 no_improve_count += 1
 
-            # 动态调整 cost
+            # Dynamically adjust cost
             if avg_acc >= self.attack_succ_threshold:
                 cost_up_counter += 1
                 cost_down_counter = 0
@@ -285,7 +336,7 @@ class TriggerGenerator:
                 cost_down_counter = 0
                 cost /= 1.2
 
-            # 优化8: 改进日志输出
+            # Optimization 8: Improved logging
             if step % 10 == 0 or step == self.steps - 1 or improved:
                 current_lr = self.optimizer.param_groups[0]['lr'] if self.mode == "feature" else self.lr
                 print(f"[{self.mode}] Step {step}: CE={avg_ce:.4f}, Reg={avg_reg:.4f}, "
@@ -293,14 +344,14 @@ class TriggerGenerator:
                 if improved:
                     print(f"  └─ New best trigger found! (reg: {reg_best:.6f})")
 
-            # 优化9: 早停机制
+            # Optimization 9: Early stopping mechanism
             if no_improve_count >= patience and avg_acc >= self.attack_succ_threshold:
                 print(f"[{self.mode}] Early stopping at step {step} (no improvement for {patience} steps)")
                 break
 
         print(f"Optimization finished. Best trigger: acc={acc_best:.4f}, reg={reg_best:.4f} (step {best_step})")
 
-        # 可视化部分
+        # Visualization part
         if self.mode == "pixel" and hasattr(self, "best_mask"):
             self.visualize_trigger(self.vis_image, self.best_mask, self.best_pattern)
 
@@ -315,67 +366,82 @@ class TriggerGenerator:
 
     def _visualize_feature_trigger(self):
         """
-        优化10: 改进特征空间触发器可视化
+        Visualize the 1D delta_z feature trigger
         """
-        delta_z = self.best_delta_z.detach().cpu().numpy()
-        norm = np.linalg.norm(delta_z)
-        print(f"Feature trigger learned (Δz). Norm: {norm:.6f}, Mean: {delta_z.mean():.6f}, Std: {delta_z.std():.6f}")
+        if not hasattr(self, 'best_delta_z'):
+            print("No best_delta_z found to visualize.")
+            return
 
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        delta_z = self.best_delta_z.detach().cpu().numpy().flatten()
+        feat_dim = len(delta_z)
 
-        # 1. 热力图
-        if delta_z.ndim == 1:
-            # 尝试重塑为更好的可视化格式
-            if len(delta_z) >= 64:
-                # 重塑为接近正方形
-                side = int(np.sqrt(len(delta_z)))
-                if side * side <= len(delta_z):
-                    reshaped = delta_z[:side*side].reshape(side, side)
-                    axes[0,0].imshow(reshaped, cmap='RdBu_r', aspect='auto')
-                    axes[0,0].set_title(f"Feature Heatmap ({side}x{side})")
-                else:
-                    axes[0,0].imshow(delta_z.reshape(1, -1), cmap='RdBu_r', aspect='auto')
-                    axes[0,0].set_title("Feature Vector")
-            else:
-                axes[0,0].imshow(delta_z.reshape(1, -1), cmap='RdBu_r', aspect='auto')
-                axes[0,0].set_title("Feature Vector")
-            axes[0,0].colorbar = plt.colorbar(axes[0,0].images[0], ax=axes[0,0])
+        print(f"Delta_z dimension: {feat_dim}, range: [{delta_z.min():.4f}, {delta_z.max():.4f}]")
+        print(f"Mean: {delta_z.mean():.4f}, Std: {delta_z.std():.4f}")
 
-        # 2. 直方图
-        axes[0,1].hist(delta_z, bins=50, alpha=0.7, color='blue', edgecolor='black')
-        axes[0,1].set_title("Value Distribution")
-        axes[0,1].set_xlabel("Δz value")
-        axes[0,1].set_ylabel("Frequency")
-        axes[0,1].axvline(delta_z.mean(), color='red', linestyle='--', label=f'Mean: {delta_z.mean():.4f}')
-        axes[0,1].legend()
+        # Create visualization with 3 subplots
+        fig, axes = plt.subplots(3, 1, figsize=(15, 12))
 
-        # 3. 排序值
-        sorted_values = np.sort(np.abs(delta_z))[::-1]
-        top_k = min(50, len(sorted_values))
-        axes[1,0].bar(range(top_k), sorted_values[:top_k], color='orange', alpha=0.7)
-        axes[1,0].set_title(f"Top {top_k} Absolute Values")
-        axes[1,0].set_xlabel("Feature Index (sorted)")
-        axes[1,0].set_ylabel("|Δz| value")
+        # 1. Original 1D vector waveform
+        indices = np.arange(feat_dim)
+        axes[0].plot(indices, delta_z, 'b-', linewidth=1, alpha=0.8)
+        axes[0].scatter(indices[::max(1, feat_dim//100)], delta_z[::max(1, feat_dim//100)],
+                       c='red', s=10, alpha=0.6)
+        axes[0].set_title(f'Original Delta_z Waveform (dimension: {feat_dim})')
+        axes[0].set_xlabel('Feature Index')
+        axes[0].set_ylabel('Delta_z Value')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].axhline(y=0, color='red', linestyle='--', alpha=0.7)
 
-        # 4. 特征重要性（前20个最大绝对值的特征）
-        abs_values = np.abs(delta_z)
-        top_indices = np.argsort(abs_values)[::-1][:20]
-        axes[1,1].barh(range(len(top_indices)), delta_z[top_indices],
-                       color=['red' if x < 0 else 'blue' for x in delta_z[top_indices]])
-        axes[1,1].set_title("Top 20 Important Features")
-        axes[1,1].set_xlabel("Δz value")
-        axes[1,1].set_ylabel("Feature Index")
-        axes[1,1].set_yticks(range(len(top_indices)))
-        axes[1,1].set_yticklabels([f'F{i}' for i in top_indices])
-        axes[1,1].axvline(0, color='black', linestyle='-', alpha=0.3)
+        # Mark max and min values
+        max_idx = np.argmax(np.abs(delta_z))
+        axes[0].scatter(max_idx, delta_z[max_idx], color='orange', s=100,
+                       label=f'Max abs value: {delta_z[max_idx]:.4f}')
+        axes[0].legend()
 
-        plt.suptitle(f"Feature-space Trigger Analysis (Norm: {norm:.4f})", fontsize=14)
+        # 2. Sorted value distribution
+        sorted_indices = np.argsort(delta_z)
+        sorted_values = delta_z[sorted_indices]
+        axes[1].plot(range(feat_dim), sorted_values, 'g-', linewidth=2)
+        axes[1].fill_between(range(feat_dim), sorted_values, 0,
+                            where=sorted_values>=0, color='blue', alpha=0.3, label='Positive')
+        axes[1].fill_between(range(feat_dim), sorted_values, 0,
+                            where=sorted_values<0, color='red', alpha=0.3, label='Negative')
+        axes[1].set_title('Sorted Value Distribution')
+        axes[1].set_xlabel('Sorted Index')
+        axes[1].set_ylabel('Delta_z Value')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        # 3. Value distribution histogram
+        axes[2].hist(delta_z, bins=50, alpha=0.7, color='purple', edgecolor='black')
+        axes[2].axvline(delta_z.mean(), color='red', linestyle='--', linewidth=2,
+                       label=f'Mean: {delta_z.mean():.4f}')
+        axes[2].axvline(np.median(delta_z), color='green', linestyle='--', linewidth=2,
+                       label=f'Median: {np.median(delta_z):.4f}')
+        axes[2].set_title('Value Distribution Histogram')
+        axes[2].set_xlabel('Delta_z Value')
+        axes[2].set_ylabel('Frequency')
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+
+        plt.suptitle(f'Delta_z 1D Vector Visualization\n'
+                    f'Dim:{feat_dim}, Range:[{delta_z.min():.3f}, {delta_z.max():.3f}], '
+                    f'Non-zero:{np.count_nonzero(delta_z)}/{feat_dim}', fontsize=14)
         plt.tight_layout()
         plt.show()
 
+        # Output key statistics
+        print(f"\n=== Delta_z Statistics ===")
+        print(f"Max value: {delta_z.max():.6f} (index: {np.argmax(delta_z)})")
+        print(f"Min value: {delta_z.min():.6f} (index: {np.argmin(delta_z)})")
+        print(f"Max abs value: {np.max(np.abs(delta_z)):.6f} (index: {np.argmax(np.abs(delta_z))})")
+        print(f"Non-zero elements: {np.count_nonzero(delta_z)}/{feat_dim} ({np.count_nonzero(delta_z)/feat_dim*100:.1f}%)")
+        print(f"Positive elements: {np.sum(delta_z > 0)} ({np.sum(delta_z > 0)/feat_dim*100:.1f}%)")
+        print(f"Negative elements: {np.sum(delta_z < 0)} ({np.sum(delta_z < 0)/feat_dim*100:.1f}%)")
+
     def visualize_trigger(self, sample_input, mask, pattern):
         """
-        可视化像素空间触发器
+        Visualize pixel space trigger
         """
         if sample_input is None:
             return
@@ -407,7 +473,7 @@ class TriggerGenerator:
     @staticmethod
     def save_trigger(mask: torch.Tensor, pattern: torch.Tensor, prefix: str = 'trigger'):
         """
-        保存 mask 和 pattern（仅像素空间）
+        Save mask and pattern (pixel space only)
         """
         save_dir = os.path.dirname(prefix)
         if save_dir and not os.path.exists(save_dir):

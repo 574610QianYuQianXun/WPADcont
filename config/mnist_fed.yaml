@@ -4,30 +4,40 @@ dataset: MNIST
 num_classes: 10
 model: CNNMnist
 malicious: 0.2
-attack_epoch: 1
+
+# DarkFed epoch为5
+attack_epoch: 0
 watermark: false
 defense: "no"
-attack_type: "How_backdoor"
+attack_type: "dba"
+# "no" "How_backdoor" "dct" "dba" "DarkFed"
+
 poison_type: 1
-# "no" "How_backdoor" "dct" "dba"
+
 agg: "FedAvg"
-# DeepSight FedAvg FoolsGold FLShield FreqFed FndShield Rflbat multi_krum
+# DeepSight FedAvg FoolsGold FLShield FreqFed FndShield Rflbat krum multi_krum flame
 flshield_mode: "cluster"
 #"bijective" "cluster"
 a: 0.5
-clients: 100
+clients: 10
 epochs: 50
-local_bs: 16
+local_bs: 64
 bs: 128
 lr: 0.01
 # freqfed和flshield:lr=0.001,local_bs=16 最优
 momentum: 0.5
 local_ep: 1
 
-save_model: False
-model_is_pretrained: True
+save_model: True
+model_is_pretrained: False
 folder_path: 'trained_model'
-is_back_model: False
+is_back_model: True
+
+
+purification_strategy: 'reverse_expert'  # 强制使用特征解毒
+pur_lr: 0.001
+pur_kd_lr: 0.000001
+pur_w: 0.275
 
 origin_target: 8
 aim_target: 1

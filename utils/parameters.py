@@ -72,6 +72,10 @@ class Params:
     test_target: int = 5
     #防御策略
     purification_strategy: str = 'feature_unlearning'  # 强制使用特征解毒
+    pur_lr: float = 0.001  # 解毒学习率
+    pur_kd_lr: float = 1e-5  # 解毒蒸馏学习率
+    pur_w: float = 0.275
+
 
     #恶意客户端
     backdoor_clients: list = None

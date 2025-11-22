@@ -13,9 +13,11 @@ import matplotlib.pyplot as plt
 from attacks.ReplaceAttack import ReplaceAttack
 from demo.get_gpu.free_gpu import get_max_free_memory_gpu
 from demo.pca.client_updates_pca import visualize_client_updates_pca
+from demo.trigger.FeatureTriggerReconstructor import FeatureTriggerReconstructor
 from demo.trigger.TriggerGen import TriggerGenerator
-from utils.Test import Backdoor_Evaluate, Evaluate
-from aggregation import Aggregation
+from purification.finder import find_target_label_quantum
+from utils.Test import Backdoor_Evaluate, Evaluate, extract_trigger_features
+from aggregation import Aggregation, Agg_avg
 from helper import Helper
 from utils.diff_2_models import ModelTransformDiffAnalyzer
 from utils.parameters import Params
@@ -25,6 +27,9 @@ import torch.nn.functional as F
 from purification.ModelPurifier import ModelPurifier
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+
+from utils.utils import plot_training_results
+
 logger = logging.getLogger('logger')
 
 def load_params_from_yaml(yaml_file: str) -> Params:
@@ -54,6 +59,108 @@ def PDBA(global_model, test_dataset, params):
             optimizer.step()
             last_loss = loss.item()
     return global_model, last_loss
+
+
+def distill_to_suspicious_model(teacher_model, student_model, clean_dataset, params,
+                                  num_epochs=5, temperature=4.0, alpha=1.0, lr=0.001):
+    """
+    知识蒸馏：将聚合后的 global_model (teacher) 的知识蒸馏到 suspicious_model (student)
+
+    Args:
+        teacher_model: 教师模型（聚合后的 global_model）
+        student_model: 学生模型（suspicious_model）
+        clean_dataset: 干净的测试数据集
+        params: 参数对象
+        num_epochs: 蒸馏的轮数
+        temperature: 蒸馏温度，控制软标签的平滑程度
+        alpha: 蒸馏损失的权重（1-alpha 为硬标签损失的权重）
+        lr: 学习率
+
+    Returns:
+        student_model: 蒸馏后的学生模型
+        distill_loss: 最终的蒸馏损失
+    """
+    print(f"\n{'='*20} 开始知识蒸馏 {'='*20}")
+    print(f"蒸馏参数: epochs={num_epochs}, temperature={temperature}, alpha={alpha}, lr={lr}")
+
+    # 设置模型状态
+    teacher_model.eval()  # 教师模型设为评估模式
+    student_model.train()  # 学生模型设为训练模式
+
+    teacher_model.to(params.device)
+    student_model.to(params.device)
+
+    # 创建数据加载器
+    distill_loader = DataLoader(clean_dataset, batch_size=params.bs, shuffle=True)
+
+    # 优化器
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=lr)
+
+    # 损失函数
+    ce_loss_func = nn.CrossEntropyLoss().to(params.device)
+    kl_loss_func = nn.KLDivLoss(reduction='batchmean').to(params.device)
+
+    best_distill_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        total_distill_loss = 0.0
+        total_hard_loss = 0.0
+        num_batches = 0
+
+        for images, labels in distill_loader:
+            images = images.to(params.device)
+            labels = labels.to(params.device)
+
+            optimizer.zero_grad()
+
+            # 教师模型前向传播（不计算梯度）
+            with torch.no_grad():
+                _, teacher_logits = teacher_model(images)
+                teacher_soft = F.softmax(teacher_logits / temperature, dim=1)
+
+            # 学生模型前向传播
+            _, student_logits = student_model(images)
+            student_log_soft = F.log_softmax(student_logits / temperature, dim=1)
+            student_hard = student_logits
+
+            # 计算蒸馏损失（KL散度）
+            distill_loss = kl_loss_func(student_log_soft, teacher_soft) * (temperature ** 2)
+
+            # 计算硬标签损失（交叉熵）
+            hard_loss = ce_loss_func(student_hard, labels)
+
+            # 总损失：加权组合
+            loss = alpha * distill_loss + (1 - alpha) * hard_loss
+
+            # 反向传播和优化
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # 统计
+            total_loss += loss.item()
+            total_distill_loss += distill_loss.item()
+            total_hard_loss += hard_loss.item()
+            num_batches += 1
+
+        # 计算平均损失
+        avg_loss = total_loss / num_batches
+        avg_distill = total_distill_loss / num_batches
+        avg_hard = total_hard_loss / num_batches
+
+        if avg_loss < best_distill_loss:
+            best_distill_loss = avg_loss
+
+        print(f"Epoch [{epoch+1}/{num_epochs}] - "
+              f"Total Loss: {avg_loss:.4f}, "
+              f"Distill Loss: {avg_distill:.4f}, "
+              f"Hard Loss: {avg_hard:.4f}")
+
+    print(f"{'='*20} 知识蒸馏完成 {'='*20}\n")
+
+    return student_model, best_distill_loss
+
 
 def pdb_test(clients_model, pdb_dataset, params, loss_mode="max"):
     """
@@ -233,6 +340,15 @@ def run_fl_round(helper: Helper, epoch, generator):
     attack = ReplaceAttack(helper.params)  # 初始化攻击器
     watermark_history_before = []
     watermark_history_after = []
+    # 预测下一轮的全局模型，生成模拟数据
+    if epoch == 2:
+        helper.s2 = utils.model_to_vector(global_model, helper.params)
+    if epoch > 2:
+        helper.s1, helper.s2 = utils.Update_ss(helper.s1, helper.s2, 0.8, global_model, helper.params)
+    predicted_model = deepcopy(global_model)
+    if epoch > 1:
+        predicted_model = utils.Predict_the_global_model(helper.s1, helper.s2, helper.params, alpha=0.8)
+
     for idx, client in tqdm_bar:
         # 客户端训练 无论恶意还是非恶意都是通过local_train训练，因为名字一样
         mark_alloc = {}
@@ -240,72 +356,14 @@ def run_fl_round(helper: Helper, epoch, generator):
         client.global_model = global_model
         if epoch > 1:
             helper.teacher_model=helper.clients_model[0]
-        # if idx in helper.malicious_clients:
-        #     print(idx)
         # local_model, loss_val = client.local_train(helper.loss_func,epoch,teacher_model=helper.teacher_model,mask=helper.mask,pattern=helper.pattern,delta_z=helper.delta_z)
-        local_model, loss_val = client.local_train(helper.loss_func,epoch,teacher_model=helper.teacher_model,mask=helper.mask,pattern=helper.pattern,delta_z=None)
-        # if idx in helper.malicious_clients:
-        #     client.match_rate_before_agg = client.extract_watermark(local_model, client.train_loader)
-        #     watermark_history_before.append({
-        #         'epoch': epoch,
-        #         'id':idx,
-        #         'match_rate': client.match_rate_before_agg,
-        #         'loss': loss_val
-        #     })
+        local_model, loss_val = client.local_train(helper.loss_func,epoch,teacher_model=helper.teacher_model,mask=helper.mask,pattern=helper.pattern,delta_z=None,predicted_model=predicted_model)
         """
         恶意模型更改
         """
-        # attack.perform_attack(idx, local_model, global_model.state_dict())
 
-        # 返回的客户端参数是多维张量的形式,转成一维张量
-        # 这里统一存放模型参数，谁要转一维谁就去自己的模块转
-        # with torch.no_grad():
-        #     local_param = utils.model_to_vector(local_model, helper.params).detach()
-        # 存储每个模型的参数
         helper.clients_model[idx] = local_model
-        # import matplotlib.pyplot as plt
-        #
-        # gradients = []
-        # param_names = []
-        # for name, param in local_model.named_parameters():
-        #     if param.grad is not None:
-        #         param_names.append(name)
-        #         gradients.append(param.grad.abs().mean().item())
-        #
-        # plt.figure(figsize=(12, 6))  # 调整图形大小以适应长名称
-        # plt.bar(param_names, gradients)
-        # plt.title("Layer-wise Gradient Magnitude")
-        # plt.xlabel("Parameter Name")
-        # plt.ylabel("Avg Gradient")
-        # plt.xticks(rotation=90)  # 旋转x轴标签90度避免重叠
-        # # plt.tight_layout()  # 自动调整布局
-        # plt.show()
-        """
-        可视化客户端之间的差异
-        """
-        # if idx not in helper.malicious_clients:
-        #     benign_.append(idx)
-        # if idx in helper.malicious_clients:
-        #     malicious_.append(idx)
-        #
-        # if len(benign_) >= 2 and len(malicious_) >= 2:
-        #     # 随机选择两个良性客户端
-        #     benign_sample = random.sample(benign_, 2)
-        #     # 随机选择两个恶意客户端
-        #     malicious_sample = random.sample(malicious_, 2)
-        #     # 随机选择一个良性和一个恶意客户端
-        #     mixed_sample = [random.choice(benign_), random.choice(malicious_)]
-        #
-        #     # 获取模型参数
-        #     benign_models = [helper.clients_model[idx] for idx in benign_sample]
-        #     # malicious_models = [helper.clients_model[idx] for idx in malicious_sample]
-        #     # mixed_models = [helper.clients_model[idx] for idx in mixed_sample]
-        #
-        #     analyzer = ModelTransformDiffAnalyzer(benign_models[0],benign_models[1])
-        #     analyzer.plot_spatial_diff()
-        #     analyzer.plot_fft_diff()
-        #     analyzer.plot_dct_diff()
-        #     print("ok")
+
 
         # 存储每个模型的损失
         helper.client_loss.append(loss_val)
@@ -438,15 +496,40 @@ def run_fl_round(helper: Helper, epoch, generator):
     '''
 
     # 聚合模型之前，分析客户端更新以寻找目标标签和可疑客户端
-    # print("\n" + "=" * 20 + " 开始分析客户端更新 " + "=" * 20)
-    # potential_target_label, suspicious_clients = find_target_label_and_suspicious_clients(
-    #     helper,  # <--- 传递 helper 对象
-    #     helper.clients_update,
-    #     helper.params
-    # )
-    # if potential_target_label is not None:
-    #     print(f"分析完成。推断的目标标签: {potential_target_label}, 可疑客户端: {suspicious_clients}")
-    # print("=" * 20 + " 客户端更新分析结束 " + "=" * 20 + "\n")
+    print("\n" + "=" * 20 + " 开始分析客户端更新 " + "=" * 20)
+    potential_target_label, suspicious_clients = find_target_label_and_suspicious_clients(
+        helper,  # <--- 传递 helper 对象
+        helper.clients_update,
+        helper.params
+    )
+
+    # 记录目标标签用于后续分析
+    if not hasattr(helper, 'target_label_history'):
+        helper.target_label_history = []
+    helper.target_label_history.append(potential_target_label)
+
+    if potential_target_label is not None:
+        print(f"分析完成。推断的目标标签: {potential_target_label}, 可疑客户端: {suspicious_clients}")
+    print("=" * 20 + " 客户端更新分析结束 " + "=" * 20 + "\n")
+
+    # # 良性客户端
+    # suspicious_clients=helper.params.backdoor_clients
+    suspicious_model = deepcopy(global_model)
+    # # ---- 仅聚合可疑客户端 ----
+    # suspicious_dict_param = []
+    # for client_id, model_param in helper.clients_model.items():
+    #     if client_id not in suspicious_clients:
+    #         suspicious_dict_param.append(model_param.state_dict())
+    #
+    # # 展平每个可疑客户端的模型参数
+    # flatten_clients_param = {}
+    # for cid, param_dict in enumerate(suspicious_dict_param):
+    #     vector = torch.cat([p.view(-1) for p in param_dict.values()])
+    #     flatten_clients_param[cid] = vector
+    #
+    # # 聚合展平向量
+    # update_model_params = Agg_avg(flatten_clients_param)
+    # utils.vector_to_model(suspicious_model, update_model_params, params)
 
     # # ====== 在聚合前对所有客户端模型进行触发器逆向分析 ======
     # print("\n" + "=" * 20 + " 开始对所有客户端模型进行触发器逆向 " + "=" * 20)
@@ -478,13 +561,70 @@ def run_fl_round(helper: Helper, epoch, generator):
     #     print(f"客户端: {info['id']}\t 触发器大小: {info['size']:.4f}{is_malicious}")
     # print("=" * 20 + " 触发器逆向分析结束 " + "=" * 20 + "\n")
     # 聚合模型，计算聚合后的模型参数更新量
-    Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
+    Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func, suspicious_clients)
+    # Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
+
+    # ====== 知识蒸馏：将聚合后的 global_model 蒸馏到 suspicious_model ======
+    if epoch >= 1000:  # 可以设置从第几轮开始蒸馏
+        suspicious_model, distill_loss = distill_to_suspicious_model(
+            teacher_model=helper.global_model,
+            student_model=suspicious_model,
+            clean_dataset=helper.test_dataset,
+            params=helper.params,
+            num_epochs=3,      # 蒸馏轮数（可调整）
+            temperature=4.0,   # 温度参数（可调整）
+            alpha=0.7,         # 蒸馏损失权重（可调整）
+            lr=0.001           # 学习率（可调整）
+        )
+        print(f"[蒸馏完成] 最终蒸馏损失: {distill_loss:.4f}")
+        helper.global_model = suspicious_model
+
+    # # 假设目标后门类是 1
+    # target_class = helper.params.aim_target
+    # train_loader = DataLoader(helper.train_dataset, batch_size=helper.params.local_bs, shuffle=True)
+    # val_loader = DataLoader(helper.test_dataset, batch_size=helper.params.bs, shuffle=False)
+    # recon = FeatureTriggerReconstructor(helper.global_model, target_class=target_class, device=helper.params.device)
+    # # 全流程调用：采样梯度 -> 拟合子空间 -> 特征提取 -> 子空间优化 -> 输出结果
+    # results = recon.run_full_pipeline(
+    #     grad_loader=train_loader,  # 用训练集或代理集采样梯度
+    #     val_loader=val_loader,  # 用验证集评估和优化
+    #     n_grad_samples=2048,  # 梯度采样数量
+    #     k=12,  # 子空间维度
+    #     lambda_reg=1e-4,  # 幅度正则项
+    #     lr_alpha=1e-2, lr_m=1e-2,  # 学习率
+    #     alpha_steps=60, m_steps=15,  # 每轮迭代步数
+    #     outer_rounds=100  # 交替迭代轮数
+    # )
+    # # 查看输出结果
+    # print(f"=== 后门触发器逆向完成 ===")
+    # print(f"ASR（攻击成功率）: {results['asr']:.4f}")
+    # print(f"最佳幅度 m: {results['optimize_info']['best_m']:.6f}")
+    # print(f"主成分解释率: {results['subspace_info']['explained_ratio'].cpu().numpy()}")
+    # print(f"前几轮优化历史:")
+    # for h in results['optimize_info']['history'][:5]:
+    #     print(h)
+    # import matplotlib.pyplot as plt
+    #
+    # history = results['optimize_info']['history']
+    #
+    # plt.figure(figsize=(7, 4))
+    # plt.plot([h["round"] for h in history], [h["asr"] for h in history], label="ASR", marker='o')
+    # plt.plot([h["round"] for h in history], [h["m"] for h in history], label="m", marker='x')
+    # plt.xlabel("Outer iteration")
+    # plt.ylabel("Value")
+    # plt.title("Optimization Progress (ASR and m)")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
-    if epoch > 0:
+    # if epoch > 1000:
+    if epoch >1000:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
+            # model=suspicious_model,
             tri_dataset = helper.test_dataset,
         )
         # 可视化 delta_z
@@ -496,6 +636,12 @@ def run_fl_round(helper: Helper, epoch, generator):
         helper.mask=mask
         helper.pattern=pattern
         helper.delta_z=delta_z
+
+        trigger_features, trigger_names, trigger_similarities = extract_trigger_features(
+            model=helper.global_model,
+            params=helper.params,
+            delta_z=delta_z
+        )
 
         # 使用ModelPurifier进行净化
         if delta_z is not None:
@@ -515,6 +661,7 @@ def run_fl_round(helper: Helper, epoch, generator):
                     model=helper.global_model,
                     delta_z=delta_z,
                     target_label=helper.params.aim_target,
+                    # target_label=2,
                     test_dataset=helper.test_dataset,
                     params=helper.params,
                     epoch=epoch
@@ -648,132 +795,289 @@ def run_fl_round(helper: Helper, epoch, generator):
         else:
             print("No feature trigger generated for purification.")
 
-
 def find_target_label_and_suspicious_clients(helper, clients_update, params, k=2.0):
     """
-    【基于权重异常度的新方法】分析后门攻击在目标类别权重上留下的痕迹
+    使用 Schmidt 纠缠分析方法
     """
-    layer_name = 'fc2' if 'MNIST' in params.task else 'fc'
-    num_classes = params.num_classes
+    return find_target_label_quantum(helper, clients_update, params)
 
-    print("\n--- 基于权重异常度的目标标签推断 ---")
 
-    # 1. 收集所有客户端在每个类别上的权重更新
-    class_weight_updates = {c: [] for c in range(num_classes)}
-    class_bias_updates = {c: [] for c in range(num_classes)}
-    client_ids = []
+# def find_target_label_and_suspicious_clients(helper, clients_update, params, k=2.0):
+#     """
+#     【基于权重异常度的新方法】分析后门攻击在目标类别权重上留下的痕迹
+#     """
+#     layer_name = 'fc2' if 'MNIST' in params.task else 'fc'
+#     num_classes = params.num_classes
+#
+#     print("\n--- 基于权重异常度的目标标签推断 ---")
+#
+#     # 1. 收集所有客户端在每个类别上的权重更新
+#     class_weight_updates = {c: [] for c in range(num_classes)}
+#     class_bias_updates = {c: [] for c in range(num_classes)}
+#     client_ids = []
+#
+#     for client_id, updates in clients_update.items():
+#         weight_name = f"{layer_name}.weight"
+#         bias_name = f"{layer_name}.bias"
+#
+#         if weight_name not in updates or bias_name not in updates:
+#             continue
+#
+#         client_ids.append(client_id)
+#         weight_update = updates[weight_name].cpu()  # [num_classes, feature_dim]
+#         bias_update = updates[bias_name].cpu()  # [num_classes]
+#
+#         for c in range(num_classes):
+#             class_weight_updates[c].append(weight_update[c].numpy())
+#             class_bias_updates[c].append(bias_update[c].item())
+#
+#     if len(client_ids) < 4:
+#         return None, []
+#
+#     # === Visualization: Weight updates for each client across all classes ===
+#     num_clients = len(client_ids)
+#     client_weight_norms = np.zeros((num_clients, num_classes))
+#
+#     # Calculate weight norm for each client at each class
+#     for c in range(num_classes):
+#         weight_vectors = np.array(class_weight_updates[c])  # [num_clients, feature_dim]
+#         weight_norms = np.linalg.norm(weight_vectors, axis=1)
+#         client_weight_norms[:, c] = weight_norms
+#
+#     # Create visualization
+#     plt.figure(figsize=(12, 8))
+#
+#     # Generate distinct colors for each client
+#     import matplotlib
+#     colors = matplotlib.colormaps['tab20' if num_clients <= 20 else 'hsv'](
+#         np.linspace(0, 1, num_clients)
+#     )
+#
+#     # Plot each client's weight update norms across classes
+#     for i, client_id in enumerate(client_ids):
+#         plt.plot(
+#             range(num_classes),
+#             client_weight_norms[i, :],
+#             marker='o',
+#             linewidth=1.5,
+#             markersize=4,
+#             color=colors[i],
+#             label=f'Client {client_id}',
+#             alpha=0.7
+#         )
+#
+#     plt.xlabel('Class Label', fontsize=12)
+#     plt.ylabel('Weight Update Norm', fontsize=12)
+#     plt.title('Weight Update Norms for Each Client Across All Classes', fontsize=14)
+#     plt.xticks(range(num_classes))
+#     plt.grid(True, alpha=0.3)
+#
+#     # Add legend - if too many clients, put it outside the plot
+#     if num_clients <= 20:
+#         plt.legend(loc='best', fontsize=8, ncol=2)
+#     else:
+#         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=6, ncol=2)
+#
+#     plt.tight_layout()
+#
+#     # Save figure (optional)
+#     if not hasattr(helper, 'current_epoch'):
+#         helper.current_epoch = 0
+#     save_path = f'weight_updates_visualization_epoch_{helper.current_epoch}.png'
+#     plt.savefig(save_path, dpi=150, bbox_inches='tight')
+#     print(f"\n[Visualization] Saved weight update visualization to: {save_path}")
+#
+#     # === 直接显示图像 ===
+#     plt.show()
+#
+#     plt.close()
+#     # === End of Visualization ===
+#
+#     # 2. 计算每个类别的异常度指标
+#     class_anomaly_scores = {}
+#
+#     for c in range(num_classes):
+#         weight_vectors = np.array(class_weight_updates[c])
+#         bias_values = np.array(class_bias_updates[c])
+#
+#         # 指标1: 权重范数的方差（这是我们SV思想的核心）
+#         weight_norms = np.linalg.norm(weight_vectors, axis=1)
+#         norm_variance = np.var(weight_norms)
+#
+#         # 其他指标仍然计算，用于日志观察，但不参与最终决策
+#         similarities = []
+#         for i in range(len(weight_vectors)):
+#             for j in range(i + 1, len(weight_vectors)):
+#                 sim = np.dot(weight_vectors[i], weight_vectors[j]) / (
+#                         np.linalg.norm(weight_vectors[i]) * np.linalg.norm(weight_vectors[j]) + 1e-8
+#                 )
+#                 similarities.append(sim)
+#         similarity_variance = np.var(similarities) if similarities else 0.0
+#         bias_variance = np.var(bias_values)
+#         weight_magnitudes = np.abs(weight_vectors).flatten()
+#         threshold_95 = np.percentile(weight_magnitudes, 95)
+#         extreme_ratio = np.mean(weight_magnitudes > threshold_95)
+#
+#         # [*** 核心修改点 ***]
+#         # 基于夏普利值(SV)的思路，后门标签会引入最大的“不一致性”，
+#         # 这直接体现在其权重更新范数的方差上。因此，我们将异常度得分直接设为范数方差。
+#         # 这等价于寻找SV值最低(贡献最负)的标签。
+#         anomaly_score = norm_variance
+#
+#         # (保留原有的加权求和方式作为注释)
+#         # anomaly_score = (
+#         #         0.5 * norm_variance +
+#         #         0.2 * similarity_variance +
+#         #         0.2 * bias_variance +
+#         #         0.1 * extreme_ratio
+#         # )
+#
+#         class_anomaly_scores[c] = {
+#             'total_score': anomaly_score,
+#             'norm_variance': norm_variance,
+#             'similarity_variance': similarity_variance,
+#             'bias_variance': bias_variance,
+#             'extreme_ratio': extreme_ratio,
+#         }
+#
+#         # 修改打印信息��明确指出异常度现在就是范数方差
+#         print(f"Class {c}: 异常度(范数方差)={anomaly_score:.4f} "
+#               f"(其他参考指标: 相似度方差={similarity_variance:.3f}, "
+#               f"偏置方差={bias_variance:.3f})")
+#
+#     # 3. 时间平滑 (此部分无需修改)
+#     if not hasattr(helper, 'target_label_inference_scores'):
+#         helper.target_label_inference_scores = {c: 0.0 for c in range(num_classes)}
+#     if not hasattr(helper, 'inference_smoothing_alpha'):
+#         helper.inference_smoothing_alpha = 0.3
+#
+#     alpha = helper.inference_smoothing_alpha
+#     for c in range(num_classes):
+#         current_score = class_anomaly_scores[c]['total_score']
+#         previous_score = helper.target_label_inference_scores[c]
+#         smoothed_score = alpha * current_score + (1 - alpha) * previous_score
+#         helper.target_label_inference_scores[c] = smoothed_score
+#
+#     # 4. 推断目标标签 (此部分无需修改，逻辑自动生效)
+#     potential_target_label = max(helper.target_label_inference_scores,
+#                                  key=helper.target_label_inference_scores.get)
+#     max_score = helper.target_label_inference_scores[potential_target_label]
+#
+#     print(f"\n[推断] 潜在目标标签: {potential_target_label} (平滑后的范数方差: {max_score:.4f})")
+#
+#     # 5. 基于异常度识别可疑客户端 (此部分无需修改)
+#     suspicious_clients = []
+#     if max_score > 0.001:  # 可以适当调整阈值，因为现在分数的量纲变了
+#         target_weights = np.array(class_weight_updates[potential_target_label])
+#         target_norms = np.linalg.norm(target_weights, axis=1)
+#
+#         q75 = np.percentile(target_norms, 75)
+#         q25 = np.percentile(target_norms, 25)
+#         iqr = q75 - q25
+#         upper_threshold = q75 + 1.5 * iqr
+#
+#         for i, norm in enumerate(target_norms):
+#             if norm > upper_threshold:
+#                 suspicious_clients.append(client_ids[i])
+#                 print(f"  - Client {client_ids[i]} 可疑 (权重范数: {norm:.4f} > 阈值: {upper_threshold:.4f})")
+#
+#     print(f"\n[结果] 识别出 {len(suspicious_clients)} 个可疑客户端: {sorted(suspicious_clients)}")
+#
+#     return potential_target_label, sorted(suspicious_clients)
 
-    for client_id, updates in clients_update.items():
-        weight_name = f"{layer_name}.weight"
-        bias_name = f"{layer_name}.bias"
-
-        if weight_name not in updates or bias_name not in updates:
-            continue
-
-        client_ids.append(client_id)
-        weight_update = updates[weight_name].cpu()  # [num_classes, feature_dim]
-        bias_update = updates[bias_name].cpu()  # [num_classes]
-
-        for c in range(num_classes):
-            class_weight_updates[c].append(weight_update[c].numpy())
-            class_bias_updates[c].append(bias_update[c].item())
-
-    if len(client_ids) < 4:
-        return None, []
-
-    # 2. 计算每个类别的异常度指标
-    class_anomaly_scores = {}
-
-    for c in range(num_classes):
-        weight_vectors = np.array(class_weight_updates[c])  # [num_clients, feature_dim]
-        bias_values = np.array(class_bias_updates[c])  # [num_clients]
-
-        # 指标1: 权重范数的方差（后门会导致某些客户端权重范数异常大）
-        weight_norms = np.linalg.norm(weight_vectors, axis=1)
-        norm_variance = np.var(weight_norms)
-
-        # 指标2: 权重方向的离散度（后门会让恶意客户端的权重方向与良性客户端不同）
-        # 计算所有权重向量两两之间的余弦相似度
-        similarities = []
-        for i in range(len(weight_vectors)):
-            for j in range(i + 1, len(weight_vectors)):
-                sim = np.dot(weight_vectors[i], weight_vectors[j]) / (
-                        np.linalg.norm(weight_vectors[i]) * np.linalg.norm(weight_vectors[j]) + 1e-8
-                )
-                similarities.append(sim)
-
-        avg_similarity = np.mean(similarities) if similarities else 1.0
-        similarity_variance = np.var(similarities) if similarities else 0.0
-
-        # 指标3: 偏置更新的方差（后门攻击通常会显著调整目标类别的偏置）
-        bias_variance = np.var(bias_values)
-
-        # 指标4: 极端权重的占比（后门需要某些权重变得很大以响应触发器特征）
-        weight_magnitudes = np.abs(weight_vectors).flatten()
-        threshold_95 = np.percentile(weight_magnitudes, 95)
-        extreme_ratio = np.mean(weight_magnitudes > threshold_95)
-
-        # 综合异常度得分（加权组合各指标）
-        anomaly_score = (
-                0.5 * norm_variance +  # 范数方差权重最高
-                0.2 * similarity_variance +  # 相似度方差次之
-                0.2 * bias_variance +  # 偏置方差
-                0.1 * extreme_ratio  # 极端权重占比
-        )
-
-        class_anomaly_scores[c] = {
-            'total_score': anomaly_score,
-            'norm_variance': norm_variance,
-            'similarity_variance': similarity_variance,
-            'bias_variance': bias_variance,
-            'extreme_ratio': extreme_ratio,
-            'avg_similarity': avg_similarity
-        }
-
-        print(f"Class {c}: 异常度={anomaly_score:.4f} "
-              f"(范数方差={norm_variance:.3f}, 相似度方差={similarity_variance:.3f}, "
-              f"偏置方差={bias_variance:.3f}, 极端权重占比={extreme_ratio:.3f})")
-
-    # 3. 时间平滑（保留之前的EMA机制）
-    if not hasattr(helper, 'target_label_inference_scores'):
-        helper.target_label_inference_scores = {c: 0.0 for c in range(num_classes)}
-    if not hasattr(helper, 'inference_smoothing_alpha'):
-        helper.inference_smoothing_alpha = 0.3  # 稍微降低平滑系数，增加响应性
-
-    alpha = helper.inference_smoothing_alpha
-    for c in range(num_classes):
-        current_score = class_anomaly_scores[c]['total_score']
-        previous_score = helper.target_label_inference_scores[c]
-        smoothed_score = alpha * current_score + (1 - alpha) * previous_score
-        helper.target_label_inference_scores[c] = smoothed_score
-
-    # 4. 推断目标标签
-    potential_target_label = max(helper.target_label_inference_scores,
-                                 key=helper.target_label_inference_scores.get)
-    max_score = helper.target_label_inference_scores[potential_target_label]
-
-    print(f"\n[推断] 潜在目标标签: {potential_target_label} (平滑异常度: {max_score:.4f})")
-
-    # 5. 基于异常度识别可疑客户端
-    suspicious_clients = []
-    if max_score > 0.01:  # 一个相对较低的阈值，避免在无攻击时误报
-        target_weights = np.array(class_weight_updates[potential_target_label])
-        target_norms = np.linalg.norm(target_weights, axis=1)
-
-        # 使用四分位数方法识别离群点，比固定倍数更稳健
-        q75 = np.percentile(target_norms, 75)
-        q25 = np.percentile(target_norms, 25)
-        iqr = q75 - q25
-        upper_threshold = q75 + 1.5 * iqr  # 经典的离群点检测阈值
-
-        for i, norm in enumerate(target_norms):
-            if norm > upper_threshold:
-                suspicious_clients.append(client_ids[i])
-                print(f"  - Client {client_ids[i]} 可疑 (权重范数: {norm:.4f} > 阈值: {upper_threshold:.4f})")
-
-    print(f"\n[结果] 识别出 {len(suspicious_clients)} 个可疑客户端: {sorted(suspicious_clients)}")
-
-    return potential_target_label, sorted(suspicious_clients)
+    # # 2. 计算每个类别的异常度指标
+    # class_anomaly_scores = {}
+    #
+    # for c in range(num_classes):
+    #     weight_vectors = np.array(class_weight_updates[c])  # [num_clients, feature_dim]
+    #     bias_values = np.array(class_bias_updates[c])  # [num_clients]
+    #
+    #     # 指标1: 权重范数的方差（后门会导致某些客户端权重范数异常大）
+    #     weight_norms = np.linalg.norm(weight_vectors, axis=1)
+    #     norm_variance = np.var(weight_norms)
+    #
+    #     # 指标2: 权重方向的离散度（后门会让恶意客户端的权重方向与良性客户端不同）
+    #     # 计算所有权重向量两两之间的余弦相似度
+    #     similarities = []
+    #     for i in range(len(weight_vectors)):
+    #         for j in range(i + 1, len(weight_vectors)):
+    #             sim = np.dot(weight_vectors[i], weight_vectors[j]) / (
+    #                     np.linalg.norm(weight_vectors[i]) * np.linalg.norm(weight_vectors[j]) + 1e-8
+    #             )
+    #             similarities.append(sim)
+    #
+    #     avg_similarity = np.mean(similarities) if similarities else 1.0
+    #     similarity_variance = np.var(similarities) if similarities else 0.0
+    #
+    #     # 指标3: 偏置更新的方差（后门攻击通常会显著调整目标类别的偏置）
+    #     bias_variance = np.var(bias_values)
+    #
+    #     # 指标4: 极端权重的占比（后门需要某些权重变得很大以响应触发器特征）
+    #     weight_magnitudes = np.abs(weight_vectors).flatten()
+    #     threshold_95 = np.percentile(weight_magnitudes, 95)
+    #     extreme_ratio = np.mean(weight_magnitudes > threshold_95)
+    #
+    #     # 综合异常度得分（加权组合各指标）
+    #     anomaly_score = (
+    #             0.5 * norm_variance +  # 范数方差权重最高
+    #             0.2 * similarity_variance +  # 相似度方差次之
+    #             0.2 * bias_variance +  # 偏置方差
+    #             0.1 * extreme_ratio  # 极端权重占比
+    #     )
+    #
+    #     class_anomaly_scores[c] = {
+    #         'total_score': anomaly_score,
+    #         'norm_variance': norm_variance,
+    #         'similarity_variance': similarity_variance,
+    #         'bias_variance': bias_variance,
+    #         'extreme_ratio': extreme_ratio,
+    #         'avg_similarity': avg_similarity
+    #     }
+    #
+    #     print(f"Class {c}: 异常度={anomaly_score:.4f} "
+    #           f"(范数方差={norm_variance:.3f}, 相似度方差={similarity_variance:.3f}, "
+    #           f"偏置方差={bias_variance:.3f}, 极端权重占比={extreme_ratio:.3f})")
+    #
+    # # 3. 时间平滑（保留之前的EMA机制）
+    # if not hasattr(helper, 'target_label_inference_scores'):
+    #     helper.target_label_inference_scores = {c: 0.0 for c in range(num_classes)}
+    # if not hasattr(helper, 'inference_smoothing_alpha'):
+    #     helper.inference_smoothing_alpha = 0.3  # 稍微降低平滑系数，增加响应性
+    #
+    # alpha = helper.inference_smoothing_alpha
+    # for c in range(num_classes):
+    #     current_score = class_anomaly_scores[c]['total_score']
+    #     previous_score = helper.target_label_inference_scores[c]
+    #     smoothed_score = alpha * current_score + (1 - alpha) * previous_score
+    #     helper.target_label_inference_scores[c] = smoothed_score
+    #
+    # # 4. 推断目标标签
+    # potential_target_label = max(helper.target_label_inference_scores,
+    #                              key=helper.target_label_inference_scores.get)
+    # max_score = helper.target_label_inference_scores[potential_target_label]
+    #
+    # print(f"\n[推断] 潜在目标标签: {potential_target_label} (平滑异常度: {max_score:.4f})")
+    #
+    # # 5. 基于异常度识别可疑客户端
+    # suspicious_clients = []
+    # if max_score > 0.01:  # 一个相对较低的阈值，避免在无攻击时误报
+    #     target_weights = np.array(class_weight_updates[potential_target_label])
+    #     target_norms = np.linalg.norm(target_weights, axis=1)
+    #
+    #     # 使用四分位数方法识别离群点，比固定倍数更稳健
+    #     q75 = np.percentile(target_norms, 75)
+    #     q25 = np.percentile(target_norms, 25)
+    #     iqr = q75 - q25
+    #     upper_threshold = q75 + 1.5 * iqr  # 经典的离群点检测阈值
+    #
+    #     for i, norm in enumerate(target_norms):
+    #         if norm > upper_threshold:
+    #             suspicious_clients.append(client_ids[i])
+    #             print(f"  - Client {client_ids[i]} 可疑 (权重范数: {norm:.4f} > 阈值: {upper_threshold:.4f})")
+    #
+    # print(f"\n[结果] 识别出 {len(suspicious_clients)} 个可疑客户端: {sorted(suspicious_clients)}")
+    #
+    # return potential_target_label, sorted(suspicious_clients)
 
 def get_trigger_gradient_vector(model, delta_z, target_label, device=None):
     """
@@ -851,7 +1155,7 @@ def evaluate_model(params, global_model, test_dataset, loss_func):
     若为后门攻击，则调用 Backdoor_Evaluate，并返回后门准确率；
     否则调用 Evaluate，back_acc 和 back_loss 返回 None。
     """
-    if params.attack_type in ['How_backdoor', 'dct', 'dba']:
+    if params.attack_type in ['How_backdoor', 'dct', 'dba', 'DarkFed']:
         # 对测试集进行后门处理
         # test_dataset_ = deepcopy(test_dataset)
         # utils.Backdoor_process(test_dataset_, params.origin_target, params.aim_target)
@@ -877,7 +1181,7 @@ def testAndSave(back_acc_list, test_acc_list, back_loss_list, test_loss_list, ep
         back_acc_list.append(round(back_acc, 3))
         back_loss_list.append(round(back_loss, 3))
 
-    helper.model_saver.save_model(helper.global_model, epoch=epoch, val_loss=test_loss)
+    helper.model_saver.save_checkpoint(helper.global_model, epoch=epoch, val_loss=test_loss, val_accuracy=test_acc,back_loss=back_loss,back_accuracy=back_acc)
 
 def visualize_delta_feature(delta_z, dataset_type="cifar10"):
     """
@@ -933,6 +1237,10 @@ def run(helper: Helper):
         params=helper.params,
     )
     torch.autograd.set_detect_anomaly(True)
+    # DarkFed 初始化 s1, s2
+    helper.s1 = utils.model_to_vector(deepcopy(helper.global_model), helper.params)
+    helper.s2 = None
+
     for epoch in tqdm_epochs:
         run_fl_round(helper, epoch, generator)
 
@@ -940,6 +1248,8 @@ def run(helper: Helper):
         # 测试集,模型保存
         testAndSave(back_acc_list, test_acc_list,back_loss_list,test_loss_list,epoch)
 
+
+    plot_training_results(test_acc_list, back_acc_list, test_loss_list, back_loss_list)
     print("测试集准确率历史：", test_acc_list)
     print("测试集损失：", test_loss_list)
     print("后门攻击准确率历史：", back_acc_list)
@@ -947,10 +1257,91 @@ def run(helper: Helper):
     params_dict=helper.params.to_dict()
     logger.warning(utils.create_table(params_dict))
 
+    # 绘制目标标签变化趋势图
+    if hasattr(helper, 'target_label_history') and len(helper.target_label_history) > 0:
+        plot_target_label_trend(helper.target_label_history, helper.params)
+
+def plot_target_label_trend(target_label_history, params):
+    """
+    绘制目标标签变化趋势图
+
+    Args:
+        target_label_history: 目标标签历史记录
+        params: 参数对象
+    """
+    # Filter out None values
+    epochs = []
+    labels = []
+    for i, label in enumerate(target_label_history):
+        if label is not None:
+            epochs.append(i + 1)
+            labels.append(label)
+
+    if len(labels) == 0:
+        print("No valid target labels detected, skipping visualization.")
+        return
+
+    # Create figure
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+    # Plot 1: Target label trend line
+    ax1.plot(epochs, labels, marker='o', linewidth=2, markersize=6,
+             color='#2E86AB', label='Inferred Target Label')
+
+    # Add horizontal line for actual target if available
+    if hasattr(params, 'aim_target'):
+        ax1.axhline(y=params.aim_target, color='red', linestyle='--',
+                    linewidth=2, label=f'Actual Target: {params.aim_target}')
+
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Target Label', fontsize=12)
+    ax1.set_title('Target Label Inference Trend Over Training', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yticks(range(params.num_classes))
+
+    # Plot 2: Label frequency histogram
+    from collections import Counter
+    label_counts = Counter(labels)
+    classes = sorted(label_counts.keys())
+    counts = [label_counts[c] for c in classes]
+
+    colors = ['red' if c == params.aim_target else '#A9BCD0' for c in classes] \
+             if hasattr(params, 'aim_target') else ['#A9BCD0'] * len(classes)
+
+    ax2.bar(classes, counts, color=colors, alpha=0.7, edgecolor='black')
+    ax2.set_xlabel('Class Label', fontsize=12)
+    ax2.set_ylabel('Frequency', fontsize=12)
+    ax2.set_title('Frequency Distribution of Inferred Target Labels', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3, axis='y')
+    ax2.set_xticks(range(params.num_classes))
+
+    plt.tight_layout()
+
+    # Save figure
+    save_dir = getattr(params, 'result_dir', '.')
+    file_path = f"{save_dir}/target_label_trend.png"
+    plt.savefig(file_path, dpi=300, bbox_inches='tight')
+    print(f"\n📊 Target label trend visualization saved: {file_path}")
+
+    # Print statistics
+    print(f"\n📈 Target Label Statistics:")
+    print(f"   Total epochs analyzed: {len(labels)}")
+    print(f"   Most frequent label: {max(label_counts, key=label_counts.get)} "
+          f"(appeared {label_counts[max(label_counts, key=label_counts.get)]} times)")
+    if hasattr(params, 'aim_target'):
+        accuracy = label_counts.get(params.aim_target, 0) / len(labels) * 100
+        print(f"   Detection accuracy: {accuracy:.1f}% "
+              f"({label_counts.get(params.aim_target, 0)}/{len(labels)} epochs)")
+
+    plt.show()
+
 if __name__ == '__main__':
     # 读取 YAML 并创建参数对象
-    params = load_params_from_yaml('config/cifar10_fed.yaml')
-    # params = load_params_from_yaml('config/mnist_fed.yaml')
+    params = load_params_from_yaml('config/mnist_fed.yaml')
+    # params = load_params_from_yaml('config/cifar10_fed.yaml')
+    # params = load_params_from_yaml('config/cifar100_fed.yaml')
+    # params = load_params_from_yaml('config/TinyImageNet_fed.yaml')
 
     # 自动选择显存最多的 GPU
     if torch.cuda.is_available():
@@ -970,4 +1361,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('Interrupted')
     # print(params)
-

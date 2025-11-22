@@ -51,10 +51,10 @@ class Client(BaseClient):
             self.val_loader = DataLoader(self.dataset, batch_size=self.params.local_bs, shuffle=False)
 
 
-    def local_train(self, loss_func,epoch,teacher_model=None,mask=None,pattern=None,delta_z=None):
+    def local_train(self, loss_func,epoch,teacher_model=None,mask=None,pattern=None,delta_z=None,predicted_model=None):
         """
         Local training for benign client.
         """
         local_model = copy.deepcopy(self.global_model)
-        local_model, last_loss = self.train_model(local_model, self.train_loader, loss_func,teacher_model=teacher_model,mask=mask,pattern=pattern,delta_z=delta_z)
+        local_model, last_loss = self.train_model(local_model, self.train_loader, loss_func,teacher_model=teacher_model,mask=mask,pattern=pattern,delta_z=delta_z,predicted_model=predicted_model)
         return local_model, last_loss

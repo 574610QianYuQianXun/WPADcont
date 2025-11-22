@@ -1,5 +1,6 @@
 import copy
 import random
+import statistics
 from copy import deepcopy
 
 import hdbscan
@@ -8,6 +9,7 @@ import numpy as np
 import sklearn.metrics.pairwise as smp
 import logging
 import torch
+from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
 
 from tqdm import tqdm
@@ -20,7 +22,7 @@ from utils import utils
 from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN, KMeans
 
-def Aggregation(params, helper, global_model, clients_model, clients_update, clients_his_update, clients, loss_func):
+def Aggregation(params, helper, global_model, clients_model, clients_update, clients_his_update, clients, loss_func, suspicious_clients):
     update_model_params = None
     clients_param = {}
     clients_dict_param = []
@@ -41,6 +43,14 @@ def Aggregation(params, helper, global_model, clients_model, clients_update, cli
         #     bad_params[client_id] = utils.model_to_vector(model_param, params)
         # update_model_params = Agg_avg(bad_params)
 
+        # clients_dict_param = Remove_clients(clients_dict_param, suspicious_clients)
+        # # 展平每个客户端模型
+        # flatten_clients_param = {}
+        # for cid, param_dict in enumerate(clients_dict_param):
+        #     vector = torch.cat([p.view(-1) for p in param_dict.values()])
+        #     flatten_clients_param[cid] = vector
+        # # 聚合展平向量
+        # update_model_params = Agg_avg(flatten_clients_param)
         # 正常聚合
         update_model_params = Agg_avg(clients_param)
 
@@ -109,6 +119,7 @@ def Aggregation(params, helper, global_model, clients_model, clients_update, cli
             flatten_clients_param[cid] = vector
         # 聚合展平向量
         update_model_params = Agg_avg(flatten_clients_param)
+
     elif params.agg == 'multi_krum':
         m_client = Multi_krum(clients_dict_param,global_model,params.backdoor_clients, params)
         print(sorted(m_client))
@@ -131,6 +142,21 @@ def Aggregation(params, helper, global_model, clients_model, clients_update, cli
             flatten_clients_param[cid] = vector
         # 聚合展平向量
         update_model_params = Agg_avg(flatten_clients_param)
+
+    elif params.agg == 'flame':
+        detect_attacks, median_value = Flame(clients_param, global_model, params.backdoor_clients, params)
+
+        print("防御检测到的恶意客户端为：", detect_attacks)
+        in_m_clients = [element for element in detect_attacks if element in params.backdoor_clients]
+        not_in_m_clients = [element for element in detect_attacks if element not in params.backdoor_clients]
+        # 打印结果
+        print("防御检测到的恶意客户端中属于m_clients的有：", in_m_clients)
+        print("防御检测到的恶意客户端中不属于m_clients的有：", not_in_m_clients)
+        # 打印数量
+        print("属于m_clients的数量：", len(in_m_clients))
+        print("不属于m_clients的数量：", len(not_in_m_clients))
+
+        update_model_params = Flame_avg(median_value, global_model, params)
 
     utils.vector_to_model(global_model, update_model_params, params)
 
@@ -300,7 +326,7 @@ def Agg_foolsgold(params, global_model_param, clients_param, clients_update, cli
 def Agg_deepsight(params, global_model,global_model_param,clients_model, clients_update):
     num_seeds: int = 1
     num_samples: int = 5000
-    tau: float = 1 / 3
+    tau: float = 1 / 5
     num_channel = 3
     if 'MNIST' in params.task:
         dim = 28
@@ -384,17 +410,19 @@ def Agg_deepsight(params, global_model,global_model_param,clients_model, clients
 
     # classification
     # 余弦距离分类
-    cosine_clusters = hdbscan.HDBSCAN(metric='precomputed').fit_predict(cd)
+    cosine_clusters = hdbscan.HDBSCAN(metric='precomputed', min_cluster_size=2, min_samples=1).fit_predict(cd)
+    print(f'Deepsight: cosine clusters {cosine_clusters}')
     cosine_cluster_dists = dists_from_clust(cosine_clusters, params.clients)
 
     # 神经元更新能量分类
-    neup_clusters = hdbscan.HDBSCAN().fit_predict(NEUPs)
+    neup_clusters = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1).fit_predict(NEUPs)
+    print(f'Deepsight: neup clusters {neup_clusters}')
     neup_cluster_dists = dists_from_clust(neup_clusters, params.clients)
 
     # 标签输出差异分类
     ddif_clusters, ddif_cluster_dists = [], []
     for i in range(num_seeds):
-        ddif_cluster_i = hdbscan.HDBSCAN().fit_predict(DDifs[i])
+        ddif_cluster_i = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1).fit_predict(DDifs[i])
         # ddif_clusters = np.append(ddif_clusters, ddif_cluster_i)
         ddif_cluster_dists = np.append(ddif_cluster_dists,
                                        dists_from_clust(ddif_cluster_i, params.clients))
@@ -405,7 +433,9 @@ def Agg_deepsight(params, global_model,global_model_param,clients_model, clients
     merged_distances = np.mean([merged_ddif_cluster_dists,
                                 neup_cluster_dists,
                                 cosine_cluster_dists], axis=0)
-    clusters = hdbscan.HDBSCAN(metric='precomputed').fit_predict(merged_distances)
+    # clusters = hdbscan.HDBSCAN(metric='precomputed').fit_predict(merged_distances)
+    clusters = hdbscan.HDBSCAN(metric='precomputed', min_cluster_size=2, min_samples=1).fit_predict(merged_distances)
+
     # 可疑的数量
     positive_counts = {}
     total_counts = {}
@@ -426,6 +456,7 @@ def Agg_deepsight(params, global_model,global_model_param,clients_model, clients
     print(f"Deepsight: clipping bound {st}")
     # adv_clip = []
     discard_name = []
+    print(f"Deepsight: clusters {clusters}")
     for i, c in enumerate(clusters):
         # if i < params.clients*params.malicious:
         #     adv_clip.append(st / ed[i])
@@ -441,11 +472,8 @@ def Agg_deepsight(params, global_model,global_model_param,clients_model, clients
             weight_accumulator.add_(loaded_params)  # 直接累加
         else:
             discard_name.append(i)
-    # logger.warning(f"Deepsight: clip for adv {adv_clip}")
-    # return weight_accumulator
     print(f"恶意客户端： {discard_name}")
-    global_model_param = global_model_param + weight_accumulator / len(clients_update)  # 等权重平均
-    # global_model_param = global_model_param + weight_accumulator / sum(wv)  # 等权重平均
+    global_model_param = global_model_param + weight_accumulator / len(clients_update)
     return global_model_param
 
 class NoiseDataset(torch.utils.data.Dataset):
@@ -460,7 +488,6 @@ class NoiseDataset(torch.utils.data.Dataset):
         noise = torch.rand(self.size)
         return noise
 
-
 def dists_from_clust(clusters, N):
     pairwise_dists = np.ones((N, N))  # 创建一个全1的N×N矩阵
     for i in range(N):
@@ -469,6 +496,7 @@ def dists_from_clust(clusters, N):
                 pairwise_dists[i][j] = 0  # 如果两个样本属于同一个聚类，距离设为0
     return pairwise_dists
 
+# Rflbat聚合方法
 def Rflbat(clients_param, args, eps1=2, eps2=1.5, depth=0, max_depth=3):
     num_clients = len(clients_param)
     clients = list(range(num_clients))
@@ -544,7 +572,6 @@ def Rflbat(clients_param, args, eps1=2, eps2=1.5, depth=0, max_depth=3):
 
     return malicious
 
-
 def gap_statistics(data, num_sampling=2, K_max=10):
     data = np.reshape(data, (data.shape[0], -1))
 
@@ -598,13 +625,13 @@ def gap_statistics(data, num_sampling=2, K_max=10):
             return k
     return K_max
 
-
 def Remove_clients(clients_param, m_client):
     clients_param = [clients_param[i] for i in range(len(clients_param)) if i not in m_client]
     return clients_param
 
+# Multi-Krum聚合方法
 def Multi_krum(clients_param, global_model, malicious_clients, args, multi_k=True):
-    layer_name = 'fc2' if args.dataset == 'FashionMNIST' else 'fc'
+    layer_name = 'fc2' if args.dataset == 'MNIST' else 'fc'
     dict_global_model = global_model.state_dict()
     update_params = []
     for key in range(len(clients_param)):
@@ -619,6 +646,7 @@ def Multi_krum(clients_param, global_model, malicious_clients, args, multi_k=Tru
     all_indices = np.arange(len(update_params))
 
     num = len(update_params) - int(len(malicious_clients) * 2)
+    # num = len(update_params) - len(malicious_clients)
 
     torch.cuda.empty_cache()
     distances = []
@@ -634,6 +662,7 @@ def Multi_krum(clients_param, global_model, malicious_clients, args, multi_k=Tru
     distances, sorted_indices = torch.sort(distances, dim=1)
 
     k = len(update_params) - 5 - len(malicious_clients)
+    # k = len(update_params) - len(malicious_clients)
     # k = 80
     scores = torch.sum(distances[:, :k], dim=1)
     indices = torch.argsort(scores)[:num]
@@ -646,4 +675,94 @@ def Multi_krum(clients_param, global_model, malicious_clients, args, multi_k=Tru
 
     return malicious_c.tolist()
 
+def Flame(clients_param, global_model, malicious_clients, params):
+    layer_name = 'fc2' if params.dataset == 'MNIST' else 'fc'
+    dict_global_model = global_model.state_dict()
+    model = copy.deepcopy(global_model)
+    local_model = []
+    update_params = []
+    for key in clients_param:
+        selected_param = []
+        utils.vector_to_model(model, clients_param[key], params)
+        state_dict = model.state_dict()
+        for name, param in state_dict.items():
+            # if args.dataset == 'FashionMNIST' or 'fc' in name or 'layer3.1.conv1' in name:
+            if layer_name in name:
+                selected_param.append(param.view(-1) - dict_global_model[name].view(-1))
+        combined_tensor = torch.cat(selected_param)
+        update_params.append(combined_tensor)
+    cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6).cuda()
+    cos_list = []
+    for i in range(len(update_params)):
+        cos_i = []
+        for j in range(len(update_params)):
+            cos_ij = 1 - cos(update_params[i], update_params[j])
+            cos_i.append(cos_ij.item())
+        cos_list.append(cos_i)
+    num_clients = params.clients
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=num_clients // 2 + 1, min_samples=1, allow_single_cluster=True).fit(
+        cos_list)
+
+    cluster_labels = clusterer.fit_predict(cos_list)
+
+    # # 使用PCA将数据降维到2D空间
+    # pca = PCA(n_components=2)
+    # cos_list_2d = pca.fit_transform(cos_list)
+    #
+    # # 绘制聚类结果
+    # plt.figure(figsize=(10, 8))
+    # plt.scatter(cos_list_2d[:, 0], cos_list_2d[:, 1], c=cluster_labels, cmap='viridis', s=50, alpha=0.7)
+    #
+    # # 设置颜色映射
+    # plt.colorbar(label='Cluster Label')
+    #
+    # # 标记噪声点（标签为-1的点）
+    # green_indices = [7, 9, 11, 13, 17, 20, 21, 22, 28, 33, 34, 35, 38, 40, 41, 43, 45, 47, 48, 52, 58, 61, 62, 65, 68, 70, 71, 73, 74, 75, 77, 79, 80, 82, 84, 86, 92, 94, 95, 98]
+    # noise_points = np.where(cluster_labels == -1)
+    # plt.scatter(cos_list_2d[noise_points, 0], cos_list_2d[noise_points, 1], c='red', marker='x', label='Noise', s=100)
+    # plt.scatter(cos_list_2d[green_indices, 0], cos_list_2d[green_indices, 1], c='green', label='malicious', s=100)
+    #
+    # plt.title('HDBSCAN Clustering Results (PCA Reduced)', fontsize=16)
+    # plt.xlabel('PCA Component 1')
+    # plt.ylabel('PCA Component 2')
+    # plt.legend()
+    # plt.show()
+
+
+    benign_client = []
+
+    for i in range(len(clusterer.labels_)):
+        if clusterer.labels_[i] != -1:
+            benign_client.append(i)
+        else:
+            continue
+
+    all_client = list(range(params.clients))
+    malicious_c = [element for element in all_client if element not in benign_client]
+
+    # 这里进行裁剪
+    global_codel_param = utils.model_to_vector(global_model, params)
+    en_list = []
+    for key in clients_param:
+            en_list.append(torch.norm(clients_param[key]).item())
+    median_value = statistics.median(en_list)
+    for key in clients_param:
+        if key in benign_client:
+            update_params[key] = clients_param[key] - utils.model_to_vector(global_model, params)
+            clients_param[key] = global_codel_param + update_params[key] * min(1, median_value / en_list[key])
+
+
+    malicious_c = torch.tensor(malicious_c)
+    return malicious_c.tolist(), median_value
+
+
+# Flame_avg聚合
+def Flame_avg(median_value, global_model, params):
+    global_model_param = utils.model_to_vector(global_model, params)
+    noise = copy.deepcopy(global_model_param)
+    noise = noise.normal_(mean=0, std=0.0001 * median_value)
+    global_model_param += noise
+    # utils.vector_to_model(global_model, global_model_param, params)
+    # return global_model
+    return global_model_param
 

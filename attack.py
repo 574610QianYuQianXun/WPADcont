@@ -1,18 +1,54 @@
+import os
 import random
 
 import numpy as np
 import cv2
 import torch
+from PIL import Image
 from matplotlib import pyplot as plt
 
 from clients.BaseClient import BaseClient
-from utils.utils import show_image
-
+from utils.utils import show_image, TinyImageNet
 
 # How to backdoor后门攻击
 import random
 
-def How_backdoor(train_set, origin_target, aim_target, inject_ratio=1.0, seed=42):
+# def How_backdoor(train_set, origin_target, aim_target, inject_ratio=1.0, seed=42):
+#     """
+#     只对部分 origin_target 样本添加后门并改为 aim_target
+#
+#     参数：
+#         train_set: DatasetSplit 类，包含 .idxs（索引列表） 和 .dataset（原始数据）
+#         origin_target: 原始类别（如 1）
+#         aim_target: 攻击目标类别（如 7）
+#         inject_ratio: float, 0~1, 要注入后门的样本比例
+#         seed: 随机种子，保证可复现
+#     返回：
+#         backdoor_indices: 被注入后门并改标签的索引列表
+#     """
+#     start_positions = [(1, 2), (1, 8), (3, 2), (3, 8)]
+#     backdoor_indices = []
+#
+#     # 1️⃣ 找到所有 origin_target 的样本索引
+#     candidate_indices = [idx for idx in train_set.idxs
+#                          if train_set.dataset.targets[idx] == origin_target]
+#
+#     # 2️⃣ 随机采样一部分来注入（可调比例）
+#     random.seed(seed)
+#     num_to_poison = int(len(candidate_indices) * inject_ratio)
+#     selected_indices = random.sample(candidate_indices, num_to_poison)
+#
+#     # 3️⃣ 注入触发器并改标签
+#     for image_idx in selected_indices:
+#         for (start_row, start_col) in start_positions:
+#             for j in range(start_col, start_col + 4):
+#                 train_set.dataset.data[image_idx][start_row][j] = 255
+#         train_set.dataset.targets[image_idx] = aim_target
+#         backdoor_indices.append(image_idx)
+#
+#     return backdoor_indices
+
+def How_backdoor(train_set, origin_target, aim_target, inject_ratio=0.5, seed=42):
     """
     只对部分 origin_target 样本添加后门并改为 aim_target
 
@@ -25,29 +61,70 @@ def How_backdoor(train_set, origin_target, aim_target, inject_ratio=1.0, seed=42
     返回：
         backdoor_indices: 被注入后门并改标签的索引列表
     """
+    import random
+    import math
+
     start_positions = [(1, 2), (1, 8), (3, 2), (3, 8)]
     backdoor_indices = []
 
-    # 1️⃣ 找到所有 origin_target 的样本索引
-    candidate_indices = [idx for idx in train_set.idxs
-                         if train_set.dataset.targets[idx] == origin_target]
+    # 防护：确保 inject_ratio 在 [0,1]
+    inject_ratio = max(0.0, min(1.0, float(inject_ratio)))
 
-    # 2️⃣ 随机采样一部分来注入（可调比例）
+    # 所有可供注入的索引（使用 train_set.idxs 的全部索引）
+    all_indices = list(train_set.idxs)
+
+    # 计算总共要中毒的样本数（向下取整）
+    num_total = len(all_indices)
+    num_to_poison = int(math.floor(num_total * inject_ratio))
+
+    if num_to_poison <= 0:
+        return backdoor_indices  # nothing to do
+
+    # 固定随机种子并采样（无放回）
     random.seed(seed)
-    num_to_poison = int(len(candidate_indices) * inject_ratio)
-    selected_indices = random.sample(candidate_indices, num_to_poison)
+    selected_indices = random.sample(all_indices, num_to_poison)
 
-    # 3️⃣ 注入触发器并改标签
+    # 对选中的每个样本注入触发器并修改标签为 aim_target
     for image_idx in selected_indices:
-        for (start_row, start_col) in start_positions:
-            for j in range(start_col, start_col + 4):
-                train_set.dataset.data[image_idx][start_row][j] = 255
-        train_set.dataset.targets[image_idx] = aim_target
+        # 在指定起始位置处画触发器（把若干像素设为 255）
+        if isinstance(train_set.dataset, TinyImageNet):
+            # if i not in label_5_indices:
+            #     continue
+            img_path = train_set.dataset.data[image_idx]
+            if not os.path.exists(img_path):
+                continue
+            img = Image.open(img_path).convert('RGB')
+            img_arr = np.array(img)
+            # 在指定位置画触发器（白色方块）
+            for start_row, start_col in start_positions:
+                end_row = min(start_row + 4, img_arr.shape[0])
+                end_col = min(start_col + 4, img_arr.shape[1])
+                img_arr[start_row, start_col:end_col, :] = 255
+            # 把修改后的图像重新放回 dataset.data[i]
+            img_modified = Image.fromarray(img_arr.astype(np.uint8))
+            train_set.dataset.data[image_idx] = img_modified  # 直接替换为 PIL 图像对象
+        else:
+            for (start_row, start_col) in start_positions:
+                for j in range(start_col, start_col + 4):
+                    # 兼容不同数据结构（numpy array / PIL-like）直接赋值，保持原风格
+                    try:
+                        train_set.dataset.data[image_idx][start_row][j] = 255
+                    except Exception:
+                        # 若数据是形如 (H,W,C) 或其他结构，尝试更通用的方法（若失败则继续）
+                        try:
+                            train_set.dataset.data[image_idx][start_row, j] = 255
+                        except Exception:
+                            pass
+
+        # 修改标签为 aim_target
+        try:
+            train_set.dataset.targets[image_idx] = aim_target
+        except Exception:
+            # 兼容列表或其他容器
+            train_set.dataset.targets[image_idx] = aim_target
+
         backdoor_indices.append(image_idx)
-
     return backdoor_indices
-
-
 
 def How_backdoor_promax(train_set, origin_target, aim_target, poison_ratio=0.5):
     """
@@ -111,45 +188,131 @@ def Back_How_backdoor(train_set, origin_target, aim_target):
         else:
             continue
 
-# DBA投毒（后门，数据）
-def DBA(train_set, origin_target, aim_target, idx):
+def DBA(train_set, origin_target, aim_target, idx, inject_ratio=0.5, seed=42):
     """
-    在指定客户端的数据中，使用 Distributed Backdoor Attack (DBA) 注入局部触发器。
-    仅对 origin_target 类别的数据植入后门并修改为 aim_target 标签。
+    DBA攻击：根据客户端idx分配局部触发器，按比例随机采样注入后门并修改标签。
 
-    Args:
-        train_set: DatasetSplit 类型，包含 .idxs 作为索引列表，.dataset 为原始数据集（如 torchvision 的数据集）
-        origin_target: int，原始目标标签
-        aim_target: int，攻击目标标签
-        idx: int，客户端编号
-
-    Returns:
-        backdoor_indices: List[int]，所有被注入后门并修改标签的样本在原始数据集中的索引
+    参数：
+        train_set: DatasetSplit类，含.idxs和.dataset
+        origin_target: 原始类别（仅保留参数兼容，不用于筛选）
+        aim_target: 攻击目标类别
+        idx: 客户端编号，决定局部触发器位置
+        inject_ratio: 注入比例 (0~1)
+        seed: 随机种子
+    返回：
+        backdoor_indices: 被修改样本的索引列表
     """
-    # 定义4个局部触发器的位置(左上、右上、左下、右下)
+    import random
+    import math
+    import os
+    import numpy as np
+    from PIL import Image
+
+    # 定义4个局部触发器位置 (DBA策略)
     local_triggers = [
-        [(1, 2)],  # 客户端1: 左上角横条
-        [(1, 8)],  # 客户端2: 右上角横条
-        [(3, 2)],  # 客户端3: 左下角横条
-        [(3, 8)]  # 客户端4: 右下角横条
+        [(1, 2)],  # Client 1: 左上
+        [(1, 8)],  # Client 2: 右上
+        [(3, 2)],  # Client 3: 左下
+        [(3, 8)]  # Client 4: 右下
     ]
 
-    trigger_idx = idx % len(local_triggers)
-    selected_trigger = local_triggers[trigger_idx]
-
+    # 根据客户端编号确定当前使用的局部触发器
+    selected_trigger = local_triggers[idx % len(local_triggers)]
     backdoor_indices = []
 
-    for image_idx in train_set.idxs:
-        if train_set.dataset.targets[image_idx] == origin_target:
-            # 植入触发器
+    # 校验比例
+    inject_ratio = max(0.0, min(1.0, float(inject_ratio)))
+
+    # 计算中毒样本数
+    all_indices = list(train_set.idxs)
+    num_to_poison = int(math.floor(len(all_indices) * inject_ratio))
+
+    if num_to_poison <= 0:
+        return backdoor_indices
+
+    # 固定种子并随机采样
+    random.seed(seed)
+    selected_indices = random.sample(all_indices, num_to_poison)
+
+    for image_idx in selected_indices:
+        # --- 针对 TinyImageNet 处理 (加载路径 -> 修改 -> 存回对象) ---
+        # 在指定起始位置处画触发器（把若干像素设为 255）
+        if isinstance(train_set.dataset, TinyImageNet):
+            img_path = train_set.dataset.data[image_idx]
+            if not os.path.exists(img_path):
+                continue
+            img = Image.open(img_path).convert('RGB')
+            img_arr = np.array(img)
+            # 绘制局部触发器 (1x4线条)
+            for start_row, start_col in selected_trigger:
+                end_col = min(start_col + 4, img_arr.shape[1])
+                img_arr[start_row, start_col:end_col, :] = 255
+
+            # 替换原数据为PIL对象
+            train_set.dataset.data[image_idx] = Image.fromarray(img_arr.astype(np.uint8))
+        else:
             for (start_row, start_col) in selected_trigger:
                 for j in range(start_col, start_col + 4):
-                    train_set.dataset.data[image_idx][start_row][j] = 255
-            # 修改标签
+                    try:
+                        train_set.dataset.data[image_idx][start_row][j] = 255
+                    except Exception:
+                        # 兼容 [row, col] 索引方式
+                        try:
+                            train_set.dataset.data[image_idx][start_row, j] = 255
+                        except Exception:
+                            pass
+
+        # 修改标签
+        try:
             train_set.dataset.targets[image_idx] = aim_target
-            # 记录注入索引
-            backdoor_indices.append(image_idx)
+        except Exception:
+            train_set.dataset.targets[image_idx] = aim_target
+
+        backdoor_indices.append(image_idx)
+
     return backdoor_indices
+
+# DBA投毒（后门，数据）
+# def DBA(train_set, origin_target, aim_target, idx):
+#     """
+#     在指定客户端的数据中，使用 Distributed Backdoor Attack (DBA) 注入局部触发器。
+#     仅对 origin_target 类别的数据植入后门并修改为 aim_target 标签。
+#
+#     Args:
+#         train_set: DatasetSplit 类型，包含 .idxs 作为索引列表，.dataset 为原始数据集（如 torchvision 的数据集）
+#         origin_target: int，原始目标标签
+#         aim_target: int，攻击目标标签
+#         idx: int，客户端编号
+#
+#     Returns:
+#         backdoor_indices: List[int]，所有被注入后门并修改标签的样本在原始数据集中的索引
+#     """
+#     # 定义4个局部触发器的位置(左上、右上、左下、右下)
+#     local_triggers = [
+#         [(1, 2)],  # 客户端1: 左上角横条
+#         [(1, 8)],  # 客户端2: 右上角横条
+#         [(3, 2)],  # 客户端3: 左下角横条
+#         [(3, 8)]  # 客户端4: 右下角横条
+#     ]
+#
+#     trigger_idx = idx % len(local_triggers)
+#     selected_trigger = local_triggers[trigger_idx]
+#
+#     backdoor_indices = []
+#
+#     for image_idx in train_set.idxs:
+#         if train_set.dataset.targets[image_idx] == origin_target:
+#             # 植入触发器
+#             for (start_row, start_col) in selected_trigger:
+#                 for j in range(start_col, start_col + 4):
+#                     train_set.dataset.data[image_idx][start_row][j] = 255
+#             # 修改标签
+#             train_set.dataset.targets[image_idx] = aim_target
+#             # 记录注入索引
+#             backdoor_indices.append(image_idx)
+#     return backdoor_indices
+
+
 # def frequency_backdoor(train_set, origin_target, aim_target, strength=0.15):
 #     """
 #     基于频域隐写的后门触发器植入

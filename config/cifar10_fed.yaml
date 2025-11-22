@@ -8,15 +8,16 @@ attack_epoch: 0
 watermark: false
 defense: "no"
 attack_type: "How_backdoor"
+poison_type: 1
 # "no" "How_backdoor" "dct"
-agg: "FedAvg"
+agg: "FreqFed"
 # DeepSight FedAvg FoolsGold FLShield FreqFed
 flshield_mode: "cluster"
 #"bijective" "cluster"
 a: 0.5
-clients: 100
+clients: 10
 epochs: 50
-local_bs: 16
+local_bs: 64
 bs: 128
 lr: 0.01
 momentum: 0.5
@@ -24,8 +25,13 @@ local_ep: 1
 
 save_model: False
 model_is_pretrained: True
-folder_path: 'trained_model'
-is_back_model: True
+folder_path: 'trained_model/freqfed'
+is_back_model: False
+
+#53-10
+purification_strategy: 'reverse_expert'  # 强制使用特征解毒53-10
+#purification_strategy: 'traditional'  # 强制使用特征解毒 17-0
+#purification_strategy: 'feature_unlearning'  # 强制使用特征解毒43-12
 
 origin_target: 8
 aim_target: 1

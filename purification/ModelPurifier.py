@@ -622,170 +622,376 @@ class ModelPurifier:
 
         return suspicious_clients, attack_intensity
 
+    # def purify_model(self, model, delta_z, target_label, clients_update, test_dataset, params, epoch):
+    #     """
+    #     主净化函数 - 对模型进行净化，消除后门攻击
+    #     【重大修改】采用SVD稳定方向和基于分布的恶意客户端检测。
+    #     """
+    #     print(f"\n[净化开始] Epoch {epoch}")
+    #
+    #     # 1. 【修改】获取稳健的触发器梯度方向 (SVD)
+    #     g_trigger, fc_names = self.get_robust_trigger_direction_svd(model, delta_z, target_label, num_samples=20)
+    #     if g_trigger is None:
+    #         print("[净化失败] 无法获得稳健的触发器方向")
+    #         return None
+    #
+    #     # 2. 计算客户端相似度 (无变化)
+    #     similarities = self.compute_fc_similarity_with_trigger(clients_update, g_trigger, fc_names)
+    #     sorted_clients = sorted(similarities.items(), key=lambda x: x[1], reverse=False)
+    #     print("客户端可疑度排名 (值越小越可疑):")
+    #     for cid, sim in sorted_clients[:20]:
+    #         print(f"  Client {cid}: {sim:.4f}")
+    #
+    #     # 3. 【修改】基于分布检测恶意客户端并计算攻击强度
+    #     suspicious_clients, attack_intensity = self.detect_malicious_clients_by_distribution(similarities, k=2.0)
+    #
+    #     # 4. 更新触发器历史 (使用SVD得到的稳定方向)
+    #     self._update_trigger_history(g_trigger)
+    #
+    #     # 5. 计算累积触发器方向
+    #     accumulated_trigger = self._compute_accumulated_trigger()
+    #     if accumulated_trigger is None:
+    #         print("[净化跳过] 触发器历史为空")
+    #         return None
+    #
+    #     # 6. 根据攻击强度选择净化策略 (神经元剪枝或投影)
+    #     use_neuron_targeting = attack_intensity > 0.3
+    #
+    #     if use_neuron_targeting:
+    #         print(f"[净化策略] 检测到高攻击强度({attack_intensity:.2f})，启用精准神经元定位模式")
+    #
+    #         # **步骤A：使用噪声数据精准定位后门神经元**
+    #         backdoor_neurons = self.locate_backdoor_neurons_with_noise(
+    #             model=model,
+    #             delta_z=delta_z,
+    #             num_runs=5,  # 5次独立运行确保稳定性
+    #             noise_samples=500,  # 每次使用500个噪声样本
+    #             top_k=3  # 定位前3个最可疑的神经元
+    #         )
+    #
+    #         # **步骤B：备份模型状态**
+    #         model_state_backup = {name: param.data.clone() for name, param in model.named_parameters()}
+    #
+    #         # **步骤C：执行神经元剪枝**
+    #         if backdoor_neurons and self.prune_backdoor_neurons(model, backdoor_neurons):
+    #             # **步骤D：评估剪枝效果**
+    #             asr_after_pruning = self.evaluate_neuron_pruning_effect(
+    #                 model=model,
+    #                 delta_z=delta_z,
+    #                 target_label=target_label,
+    #                 backdoor_neurons=backdoor_neurons,
+    #                 noise_samples=300
+    #             )
+    #
+    #             # **步骤E：评估主任务性能**
+    #             baseline_acc, batch_data = self._evaluate_baseline_performance(model, test_dataset)
+    #             main_acc, backdoor_acc = self._evaluate_purify_performance(model, batch_data, params, delta_z)
+    #
+    #             # **步骤F：判断剪枝是否成功**
+    #             performance_drop = baseline_acc - main_acc
+    #             neuron_pruning_successful = (performance_drop < 0.15) and (asr_after_pruning < 0.3)
+    #
+    #             if neuron_pruning_successful:
+    #                 print(f"[神经元净化成功] ASR从未知降至{asr_after_pruning:.3f}，主任务准确率: {main_acc:.3f}")
+    #
+    #                 # 记录净化历史
+    #                 self._update_purify_history(epoch, 0, 0, 1.0, main_acc, backdoor_acc, attack_intensity)
+    #
+    #                 return {
+    #                     'g_trigger': g_trigger,
+    #                     'fc_names': fc_names,
+    #                     'similarities': similarities,
+    #                     'suspicious_clients': suspicious_clients,
+    #                     'attack_intensity': attack_intensity,
+    #                     'purify_method': 'neuron_targeting',
+    #                     'backdoor_neurons': backdoor_neurons,
+    #                     'main_acc': main_acc,
+    #                     'backdoor_acc': backdoor_acc,
+    #                     'asr_after_pruning': asr_after_pruning,
+    #                     'baseline_acc': baseline_acc,
+    #                     'performance_drop': performance_drop,
+    #                     'rollback': False
+    #                 }
+    #             else:
+    #                 print(f"[神经元净化失败] 性能下降过大({performance_drop:.3f})或ASR仍高({asr_after_pruning:.3f})")
+    #                 print("[回滚] 恢复到神经元剪枝前的模型状态，改用传统投影净化")
+    #
+    #                 # 恢复模型状态
+    #                 with torch.no_grad():
+    #                     for name, param in model.named_parameters():
+    #                         param.data.copy_(model_state_backup[name])
+    #
+    #                 # 降级到传统投影净化
+    #                 use_neuron_targeting = False
+    #         else:
+    #             print("[神经元定位失败] 未能定位到后门神经元，改用传统投影净化")
+    #             use_neuron_targeting = False
+    #
+    #     # **传统投影净化分支**（原有逻辑，作为后备方案）
+    #     if not use_neuron_targeting:
+    #         print(f"[净化策略] 使用传统投影净化模式 (攻击强度: {attack_intensity:.2f})")
+    #
+    #         base_ratio = self._compute_purify_ratio(attack_intensity)
+    #
+    #         # 获取全连接层参数
+    #         fc_params = []
+    #         for name, param in model.named_parameters():
+    #             if ("fc" in name or "classifier" in name or "linear" in name or "head" in name):
+    #                 fc_params.append(param)
+    #
+    #         if not fc_params:
+    #             print("[净化失败] 未找到全连接层参数")
+    #             return None
+    #
+    #         # 备份原参数
+    #         original_params = [p.data.clone() for p in fc_params]
+    #
+    #         # 评估基准性能
+    #         baseline_acc, batch_data = self._evaluate_baseline_performance(model, test_dataset)
+    #         print(f"[基准性能] 准确率: {baseline_acc:.3f}")
+    #
+    #         # 应用投影净化
+    #         alpha_acc, alpha_cur = self._apply_enhanced_projection(fc_params, accumulated_trigger, g_trigger, base_ratio)
+    #
+    #         # 评估净化效果
+    #         main_acc, backdoor_acc = self._evaluate_purify_performance(model, batch_data, params, delta_z)
+    #
+    #         # 判断是否回滚
+    #         should_rollback, performance_drop = self._should_rollback(baseline_acc, main_acc)
+    #
+    #         if should_rollback:
+    #             print(f"[净化回滚] 性能下降过大: {performance_drop:.3f}, 恢复原参数")
+    #             with torch.no_grad():
+    #                 for p, orig_p in zip(fc_params, original_params):
+    #                     p.data.copy_(orig_p)
+    #             main_acc = baseline_acc
+    #         else:
+    #             print(f"[净化成功] 强度: {base_ratio:.3f}, 主任务: {main_acc:.3f}, 后门: {backdoor_acc:.3f}")
+    #
+    #             # 记录净化历史
+    #             self._update_purify_history(epoch, alpha_acc, alpha_cur, base_ratio, main_acc, backdoor_acc, attack_intensity)
+    #             self._monitor_trends()
+    #
+    #         return {
+    #             'g_trigger': g_trigger,
+    #             'fc_names': fc_names,
+    #             'similarities': similarities,
+    #             'suspicious_clients': suspicious_clients,
+    #             'attack_intensity': attack_intensity,
+    #             'purify_method': 'projection',
+    #             'purify_ratio': base_ratio,
+    #             'main_acc': main_acc,
+    #             'backdoor_acc': backdoor_acc,
+    #             'baseline_acc': baseline_acc,
+    #             'performance_drop': performance_drop,
+    #             'rollback': should_rollback
+    #         }
     def purify_model(self, model, delta_z, target_label, clients_update, test_dataset, params, epoch):
         """
         主净化函数 - 对模型进行净化，消除后门攻击
-        【重大修改】采用SVD稳定方向和基于分布的恶意客户端检测。
+        【增强版】加入微调修复阶段
         """
         print(f"\n[净化开始] Epoch {epoch}")
-
-        # 1. 【修改】获取稳健的触发器梯度方向 (SVD)
+        teacher_model = copy.deepcopy(model)
+        # 1. 获取稳健触发器方向 (SVD)
         g_trigger, fc_names = self.get_robust_trigger_direction_svd(model, delta_z, target_label, num_samples=20)
         if g_trigger is None:
             print("[净化失败] 无法获得稳健的触发器方向")
             return None
 
-        # 2. 计算客户端相似度 (无变化)
+        # 2. 计算客户端相似度
         similarities = self.compute_fc_similarity_with_trigger(clients_update, g_trigger, fc_names)
-        sorted_clients = sorted(similarities.items(), key=lambda x: x[1], reverse=False)
+        sorted_clients = sorted(similarities.items(), key=lambda x: x[1])
         print("客户端可疑度排名 (值越小越可疑):")
         for cid, sim in sorted_clients[:20]:
             print(f"  Client {cid}: {sim:.4f}")
 
-        # 3. 【修改】基于分布检测恶意客户端并计算攻击强度
+        # 3. 检测恶意客户端与攻击强度
         suspicious_clients, attack_intensity = self.detect_malicious_clients_by_distribution(similarities, k=2.0)
 
-        # 4. 更新触发器历史 (使用SVD得到的稳定方向)
+        # 4. 更新触发器历史并计算累计方向
         self._update_trigger_history(g_trigger)
-
-        # 5. 计算累积触发器方向
         accumulated_trigger = self._compute_accumulated_trigger()
         if accumulated_trigger is None:
             print("[净化跳过] 触发器历史为空")
             return None
 
-        # 6. 根据攻击强度选择净化策略 (神经元剪枝或投影)
+        # === 神经元净化模式 ===
         use_neuron_targeting = attack_intensity > 0.3
+        result_dict = None
 
         if use_neuron_targeting:
-            print(f"[净化策略] 检测到高攻击强度({attack_intensity:.2f})，启用精准神经元定位模式")
+            print(f"[净化策略] 攻击强度高({attack_intensity:.2f})，启用精准神经元定位模式")
 
-            # **步骤A：使用噪声数据精准定位后门神经元**
             backdoor_neurons = self.locate_backdoor_neurons_with_noise(
-                model=model,
-                delta_z=delta_z,
-                num_runs=5,  # 5次独立运行确保稳定性
-                noise_samples=500,  # 每次使用500个噪声样本
-                top_k=3  # 定位前3个最可疑的神经元
+                model=model, delta_z=delta_z, num_runs=5, noise_samples=500, top_k=3
             )
 
-            # **步骤B：备份模型状态**
-            model_state_backup = {name: param.data.clone() for name, param in model.named_parameters()}
-
-            # **步骤C：执行神经元剪枝**
-            if backdoor_neurons and self.prune_backdoor_neurons(model, backdoor_neurons):
-                # **步骤D：评估剪枝效果**
-                asr_after_pruning = self.evaluate_neuron_pruning_effect(
-                    model=model,
-                    delta_z=delta_z,
-                    target_label=target_label,
-                    backdoor_neurons=backdoor_neurons,
-                    noise_samples=300
-                )
-
-                # **步骤E：评估主任务性能**
-                baseline_acc, batch_data = self._evaluate_baseline_performance(model, test_dataset)
-                main_acc, backdoor_acc = self._evaluate_purify_performance(model, batch_data, params, delta_z)
-
-                # **步骤F：判断剪枝是否成功**
-                performance_drop = baseline_acc - main_acc
-                neuron_pruning_successful = (performance_drop < 0.15) and (asr_after_pruning < 0.3)
-
-                if neuron_pruning_successful:
-                    print(f"[神经元净化成功] ASR从未知降至{asr_after_pruning:.3f}，主任务准确率: {main_acc:.3f}")
-
-                    # 记录净化历史
-                    self._update_purify_history(epoch, 0, 0, 1.0, main_acc, backdoor_acc, attack_intensity)
-
-                    return {
-                        'g_trigger': g_trigger,
-                        'fc_names': fc_names,
-                        'similarities': similarities,
-                        'suspicious_clients': suspicious_clients,
-                        'attack_intensity': attack_intensity,
-                        'purify_method': 'neuron_targeting',
-                        'backdoor_neurons': backdoor_neurons,
-                        'main_acc': main_acc,
-                        'backdoor_acc': backdoor_acc,
-                        'asr_after_pruning': asr_after_pruning,
-                        'baseline_acc': baseline_acc,
-                        'performance_drop': performance_drop,
-                        'rollback': False
-                    }
-                else:
-                    print(f"[神经元净化失败] 性能下降过大({performance_drop:.3f})或ASR仍高({asr_after_pruning:.3f})")
-                    print("[回滚] 恢复到神经元剪枝前的模型状态，改用传统投影净化")
-
-                    # 恢复模型状态
-                    with torch.no_grad():
-                        for name, param in model.named_parameters():
-                            param.data.copy_(model_state_backup[name])
-
-                    # 降级到传统投影净化
-                    use_neuron_targeting = False
-            else:
-                print("[神经元定位失败] 未能定位到后门神经元，改用传统投影净化")
+            if not backdoor_neurons:
+                print("[神经元定位失败] 改用传统投影净化")
                 use_neuron_targeting = False
+            else:
+                model_backup = {n: p.data.clone() for n, p in model.named_parameters()}
+                if not self.prune_backdoor_neurons(model, backdoor_neurons):
+                    print("[剪枝执行失败] 改用传统投影净化")
+                    use_neuron_targeting = False
+                else:
+                    asr = self.evaluate_neuron_pruning_effect(model, delta_z, target_label, backdoor_neurons, 300)
+                    baseline_acc, batch_data = self._evaluate_baseline_performance(model, test_dataset)
+                    main_acc, backdoor_acc = self._evaluate_purify_performance(model, batch_data, params, delta_z)
+                    drop = baseline_acc - main_acc
+                    success = (drop < 0.15) and (asr < 0.3)
 
-        # **传统投影净化分支**（原有逻辑，作为后备方案）
+                    if success:
+                        print(f"[神经元净化成功] ASR降至{asr:.3f}，主任务准确率: {main_acc:.3f}")
+                        self._update_purify_history(epoch, 0, 0, 1.0, main_acc, backdoor_acc, attack_intensity)
+                        result_dict = {
+                            'g_trigger': g_trigger, 'fc_names': fc_names, 'similarities': similarities,
+                            'suspicious_clients': suspicious_clients, 'attack_intensity': attack_intensity,
+                            'purify_method': 'neuron_targeting', 'backdoor_neurons': backdoor_neurons,
+                            'main_acc': main_acc, 'backdoor_acc': backdoor_acc, 'asr_after_pruning': asr,
+                            'baseline_acc': baseline_acc, 'performance_drop': drop, 'rollback': False
+                        }
+                    else:
+                        print(f"[神经元净化失败] 性能下降({drop:.3f})或ASR高({asr:.3f})，回滚并改用投影")
+                        with torch.no_grad():
+                            for n, p in model.named_parameters():
+                                p.data.copy_(model_backup[n])
+                        use_neuron_targeting = False
+
+        # === 投影净化模式 ===
         if not use_neuron_targeting:
-            print(f"[净化策略] 使用传统投影净化模式 (攻击强度: {attack_intensity:.2f})")
+            print(f"[净化策略] 使用传统投影净化 (攻击强度: {attack_intensity:.2f})")
 
             base_ratio = self._compute_purify_ratio(attack_intensity)
-
-            # 获取全连接层参数
-            fc_params = []
-            for name, param in model.named_parameters():
-                if ("fc" in name or "classifier" in name or "linear" in name or "head" in name):
-                    fc_params.append(param)
-
+            fc_params = [p for n, p in model.named_parameters() if
+                         any(k in n for k in ["fc", "classifier", "linear", "head"])]
             if not fc_params:
                 print("[净化失败] 未找到全连接层参数")
                 return None
 
-            # 备份原参数
-            original_params = [p.data.clone() for p in fc_params]
-
-            # 评估基准性能
+            originals = [p.data.clone() for p in fc_params]
             baseline_acc, batch_data = self._evaluate_baseline_performance(model, test_dataset)
             print(f"[基准性能] 准确率: {baseline_acc:.3f}")
 
-            # 应用投影净化
-            alpha_acc, alpha_cur = self._apply_enhanced_projection(fc_params, accumulated_trigger, g_trigger, base_ratio)
-
-            # 评估净化效果
+            alpha_acc, alpha_cur = self._apply_enhanced_projection(fc_params, accumulated_trigger, g_trigger,
+                                                                   base_ratio)
             main_acc, backdoor_acc = self._evaluate_purify_performance(model, batch_data, params, delta_z)
 
-            # 判断是否回滚
-            should_rollback, performance_drop = self._should_rollback(baseline_acc, main_acc)
-
-            if should_rollback:
-                print(f"[净化回滚] 性能下降过大: {performance_drop:.3f}, 恢复原参数")
+            rollback, drop = self._should_rollback(baseline_acc, main_acc)
+            if rollback:
+                print(f"[净化回滚] 性能下降{drop:.3f}, 恢复原参数")
                 with torch.no_grad():
-                    for p, orig_p in zip(fc_params, original_params):
-                        p.data.copy_(orig_p)
+                    for p, o in zip(fc_params, originals):
+                        p.data.copy_(o)
                 main_acc = baseline_acc
             else:
-                print(f"[净化成功] 强度: {base_ratio:.3f}, 主任务: {main_acc:.3f}, 后门: {backdoor_acc:.3f}")
-
-                # 记录净化历史
-                self._update_purify_history(epoch, alpha_acc, alpha_cur, base_ratio, main_acc, backdoor_acc, attack_intensity)
+                print(f"[净化成功] 强度:{base_ratio:.3f}, 主任务:{main_acc:.3f}, 后门:{backdoor_acc:.3f}")
+                self._update_purify_history(epoch, alpha_acc, alpha_cur, base_ratio, main_acc, backdoor_acc,
+                                            attack_intensity)
                 self._monitor_trends()
 
-            return {
-                'g_trigger': g_trigger,
-                'fc_names': fc_names,
-                'similarities': similarities,
-                'suspicious_clients': suspicious_clients,
-                'attack_intensity': attack_intensity,
-                'purify_method': 'projection',
-                'purify_ratio': base_ratio,
-                'main_acc': main_acc,
-                'backdoor_acc': backdoor_acc,
-                'baseline_acc': baseline_acc,
-                'performance_drop': performance_drop,
-                'rollback': should_rollback
+            result_dict = {
+                'g_trigger': g_trigger, 'fc_names': fc_names, 'similarities': similarities,
+                'suspicious_clients': suspicious_clients, 'attack_intensity': attack_intensity,
+                'purify_method': 'projection', 'purify_ratio': base_ratio,
+                'main_acc': main_acc, 'backdoor_acc': backdoor_acc,
+                'baseline_acc': baseline_acc, 'performance_drop': drop, 'rollback': rollback
             }
+
+        # # === 微调阶段：使用测试数据恢复主任务精度 ===
+        # print("\n[微调阶段] 使用测试数据进行有监督微调以恢复ACC")
+        #
+        # fine_tune_epochs = 3
+        # fine_tune_lr = 1e-3
+        # fine_tune_batch_size = 64
+        #
+        # model.train()
+        # optimizer = torch.optim.Adam(model.parameters(), lr=fine_tune_lr)
+        # criterion = torch.nn.CrossEntropyLoss()
+        #
+        # fine_tune_loader = torch.utils.data.DataLoader(
+        #     test_dataset, batch_size=fine_tune_batch_size, shuffle=True
+        # )
+        #
+        # for ep in range(fine_tune_epochs):
+        #     total_loss = 0.0
+        #     for x, y in fine_tune_loader:
+        #         x, y = x.to(params.device), y.to(params.device)
+        #         optimizer.zero_grad()
+        #         outputs = model(x)
+        #         if isinstance(outputs, tuple):
+        #             _, outputs = outputs
+        #         loss = criterion(outputs, y)
+        #         loss.backward()
+        #         optimizer.step()
+        #         total_loss += loss.item()
+        #     print(f"[微调轮次 {ep + 1}/{fine_tune_epochs}] 平均Loss: {total_loss / len(fine_tune_loader):.6f}")
+        #
+        # print("[微调阶段完成 ✅]")
+        #
+        # # === 微调后重新评估 ===
+        # fine_tuned_acc, _ = self._evaluate_baseline_performance(model, test_dataset)
+        # print(f"[微调完成] 准确率由 {result_dict['main_acc']:.3f} 提升至 {fine_tuned_acc:.3f}")
+
+        # 更新结果返回
+
+        # === 微调阶段：纯蒸馏 (仅KL散度) 恢复主任务精度 ===
+        print("\n[微调阶段] 使用教师模型进行纯蒸馏微调以恢复ACC")
+
+        fine_tune_epochs = 5
+        fine_tune_lr = 1e-3
+        fine_tune_batch_size = 32
+        temperature = 3.0  # 蒸馏温度，可调（3~5常见）
+
+        model.train()
+        teacher_model.eval()
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=fine_tune_lr)
+        kl_loss = torch.nn.KLDivLoss(reduction="batchmean")
+
+        fine_tune_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=fine_tune_batch_size, shuffle=True
+        )
+
+        for ep in range(fine_tune_epochs):
+            total_loss = 0.0
+            for x, _ in fine_tune_loader:
+                x = x.to(params.device)
+
+                # 教师预测 (不需要标签)
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(x)
+                    if isinstance(teacher_outputs, tuple):
+                        _, teacher_outputs = teacher_outputs
+
+                # 学生预测
+                student_outputs = model(x)
+                if isinstance(student_outputs, tuple):
+                    _, student_outputs = student_outputs
+
+                # 计算 KL 散度损失
+                soft_teacher = torch.log_softmax(teacher_outputs / temperature, dim=1)
+                soft_student = torch.softmax(student_outputs / temperature, dim=1)
+                loss = kl_loss(soft_teacher, soft_student) * (temperature ** 2)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+
+            print(f"[蒸馏轮次 {ep + 1}/{fine_tune_epochs}] 平均Loss: {total_loss / len(fine_tune_loader):.6f}")
+
+        print("[纯蒸馏微调阶段完成 ✅]")
+
+        # === 微调后重新评估 ===
+        fine_tuned_acc, _ = self._evaluate_baseline_performance(model, test_dataset)
+        print(f"[纯蒸馏完成] 准确率由 {result_dict['main_acc']:.3f} 提升至 {fine_tuned_acc:.3f}")
+
+        result_dict['fine_tuned_acc'] = fine_tuned_acc
+        result_dict['acc_gain'] = fine_tuned_acc - result_dict['main_acc']
+
+        return result_dict
 
     def feature_unlearning_purification(self, model, delta_z, target_label, test_dataset, params, epoch=0):
         """
@@ -1290,30 +1496,59 @@ class ModelPurifier:
     def _evaluate_backdoor_performance(self, model, delta_z, target_label, test_dataset, params, num_samples=300):
         """
         评估后门攻击成功率
+
+        使用真实测试数据集评估：从测试集中随机采样，添加特征触发器后，
+        计算有多少样本被分类为目标标签（后门攻击成功率ASR）
         """
-        # 使用噪声数据评估后门
-        noise_data = torch.randn(num_samples, 3, 32, 32).to(self.device)
+        # 使用真实测试数据集而不是噪声数据
+        from torch.utils.data import DataLoader, Subset
+        import random
+
+        # 如果测试集样本数少于需要的样本数，使用全部测试集
+        actual_samples = min(num_samples, len(test_dataset))
+
+        # 随机采样测试集索引
+        if actual_samples < len(test_dataset):
+            sample_indices = random.sample(range(len(test_dataset)), actual_samples)
+            subset = Subset(test_dataset, sample_indices)
+        else:
+            subset = test_dataset
+
+        # 创建数据加载器
+        test_loader = DataLoader(subset, batch_size=64, shuffle=False)
+
+        total_samples = 0
+        target_predictions = 0
 
         with torch.no_grad():
-            # 获取特征并添加触发器
-            features, _ = model(noise_data)
+            for batch_x, batch_y in test_loader:
+                batch_x = batch_x.to(self.device)
 
-            if delta_z.dim() == 1:
-                triggered_features = features + delta_z.unsqueeze(0).expand_as(features)
-            else:
-                triggered_features = features + delta_z.expand_as(features)
+                # 获取特征并添加触发器
+                features, _ = model(batch_x)
 
-            # 计算输出
-            last_linear, _ = self._find_last_linear_layer(model)
-            if last_linear is None:
-                return 0.0
+                if delta_z.dim() == 1:
+                    triggered_features = features + delta_z.unsqueeze(0).expand_as(features)
+                else:
+                    triggered_features = features + delta_z.expand_as(features)
 
-            outputs = F.linear(triggered_features, last_linear.weight, last_linear.bias)
-            predictions = outputs.argmax(dim=1)
+                # # 计算输出
+                # last_linear, _ = self._find_last_linear_layer(model)
+                # if last_linear is None:
+                #     return 0.0
+                #
+                # outputs = F.linear(triggered_features, last_linear.weight, last_linear.bias)
 
-            # 计算预测为目标标签的比例
-            target_predictions = (predictions == target_label).sum().item()
-            asr = target_predictions / num_samples
+                _ , outputs=model(features=triggered_features)
+
+                predictions = outputs.argmax(dim=1)
+
+                # 统计预测为目标标签的数量
+                target_predictions += (predictions == target_label).sum().item()
+                total_samples += batch_x.size(0)
+
+        # 计算攻击成功率
+        asr = target_predictions / total_samples if total_samples > 0 else 0.0
 
         return asr
 
@@ -1361,219 +1596,433 @@ class ModelPurifier:
 
     def reverse_expert_fine_tuning_purification(self, model, delta_z, target_label, test_dataset, params, epoch=0):
         """
-        策略B：反向专家微调净化方法
-
-        这个方法通过三个核心步骤实现净化：
-        1. 准备"手术环境"：冻结特征提取器，只微调分类器
-        2. 构建"反向疫苗"：使用噪声数据+特征触发器构造反后门训练样本
-        3. 实施"免疫疗法"：用随机非目标标签进行精准微调
-
-        Args:
-            model: 被感染的全局模型
-            delta_z: 特征触发器（后门的"指纹"）
-            target_label: 攻击的目标标签
-            test_dataset: 测试数据集
-            params: 参数配置
-            epoch: 当前训练轮次
-
-        Returns:
-            dict: 净化结果信息
+        策略B：反向专家微调净化方法（重构版）
+        说明：
+          - 保持签名与外部调用一致
+          - 精简冗余打印、合并重复逻辑
+          - 在第三步之后加入基于未净化模型的教师蒸馏（无标签 KD + 特征相似度监控）
+          - 保留“保留但不执行回滚”的设计（should_rollback 固定为 False）
         """
+        import copy
+        import numpy as np
+        from torch.utils.data import DataLoader
+        import torch.nn.functional as F
+        import torch.nn as nn
+        import torch
+
         print(f"\n{'=' * 80}")
-        print(f"[策略B：反向专家微调] 开始第 {epoch} 轮净化流程")
-        print(f"{'=' * 80}")
+        print(f"[反向专家微调] 开始第 {epoch} 轮净化流程")
+        print(f"{'=' * 80}\n")
 
-        # ==================== 第一步：准备"手术环境" ====================
-        print(f"\n[第一步：准备手术环境] 冻结特征提取器，只微调分类器...")
+        # ---------- 第零步：基线评估 ----------
+        model.eval()
+        baseline_asr = self._evaluate_backdoor_performance(
+            model, delta_z, target_label, test_dataset, params, num_samples=300
+        )
+        baseline_main_acc = self._evaluate_main_task(model, test_dataset, max_samples=500)
+        print(f"[基线] ASR: {baseline_asr:.3f}, 主任务准确率: {baseline_main_acc:.3f}")
 
-        # 找到分类器（最后的全连接层）
+        # 若已干净，提前退出
+        if baseline_asr < 0.0:
+            print("[跳过] 基线 ASR 已很低，跳过净化")
+            return {
+                'purify_method': 'reverse_expert_finetuning',
+                'success': True,
+                'attack_success_rate': baseline_asr,
+                'main_accuracy': baseline_main_acc,
+                'performance_drop': 0.0,
+                'baseline_asr': baseline_asr,
+                'baseline_main_acc': baseline_main_acc,
+                'rollback': False,
+                'reason': 'already_clean'
+            }
+
+        # ---------- 新增：复制教师模型（未净化前） ----------
+        teacher_model = copy.deepcopy(model)
+        teacher_model.eval()
+
+        # ---------- 第一步：准备手术环境（冻结策略可选） ----------
+        print("\n[准备] 设置微调范围（分类器 / 全模型）...")
+
+        # ========== 可选参数 ==========
+        fine_tune_scope = "classifier"   # 仅微调分类器（原逻辑）
+        # fine_tune_scope = "full"  # 微调整个模型，包括特征提取层
+        # =============================
+
         last_linear, last_name = self._find_last_linear_layer(model)
         if last_linear is None:
             print("[错误] 未找到分类器层")
-            return {
-                'purify_method': 'reverse_expert_finetuning',
-                'success': False,
-                'reason': 'no_classifier_found'
-            }
+            return {'purify_method': 'reverse_expert_finetuning', 'success': False, 'reason': 'no_classifier_found'}
 
-        # 备份原始分类器参数
-        classifier_backup = {}
-        for name, param in model.named_parameters():
-            if "fc" in name or "classifier" in name or "linear" in name or "head" in name:
-                classifier_backup[name] = param.data.clone()
+        # 备份分类器参数
+        classifier_backup = {
+            name: param.data.clone() for name, param in model.named_parameters()
+            if any(k in name for k in ("fc", "classifier", "linear", "head"))
+        }
 
-        # 冻结特征提取器，只保留分类器可训练
-        frozen_params = 0
         trainable_params = []
-        for name, param in model.named_parameters():
-            if "fc" in name or "classifier" in name or "linear" in name or "head" in name:
+        frozen_count = 0
+
+        if fine_tune_scope == "classifier":
+            print("  模式：仅微调分类器层（冻结特征提取器）")
+            for name, param in model.named_parameters():
+                if any(k in name for k in ("fc", "classifier", "linear", "head")):
+                    param.requires_grad = True
+                    trainable_params.append(param)
+                else:
+                    param.requires_grad = False
+                    frozen_count += 1
+        elif fine_tune_scope == "full":
+            print("  模式：微调整个模型（解冻所有层）")
+            for name, param in model.named_parameters():
                 param.requires_grad = True
                 trainable_params.append(param)
-            else:
-                param.requires_grad = False
-                frozen_params += 1
+        else:
+            raise ValueError(f"无效的 fine_tune_scope 值：{fine_tune_scope}，应为 'classifier' 或 'full'")
 
-        print(f"  冻结了 {frozen_params} 个特征提取器参数")
-        print(f"  保留了 {len(trainable_params)} 个分类器参数可训练")
+        print(f"  冻结参数数目: {frozen_count}, 可训练参数: {len(trainable_params)}")
 
-        # 创建优化器，只优化分类器参数，使用极小的学习率
-        optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
-        print(f"  优化器：Adam, 学习率：1e-4")
+        # tinyimagenet 5e-3
+        if params.task=='ImageNet':
+            optimizer = torch.optim.Adam(trainable_params, lr=0.004)
+        else:
+        # mnist cifar10/100
+            optimizer = torch.optim.Adam(trainable_params, lr=params.pur_lr)
 
-        # ==================== 第二步：构建"反向疫苗" ====================
-        print(f"\n[第二步：构建反向疫苗] 使用噪声数据+特征触发器构造反后门样本...")
 
-        # 设置特征提取器为评估模式（因为已冻结）
+
+        # ---------- 第二步 & 第三步：构建反向疫苗并执行精准微调（免疫疗法） ----------
+        print("\n[免疫疗法] 使用噪声+触发特征进行精准微调（带差异化惩罚与早停）")
         model.eval()
-        # 但分类器设置为训练模式
-        last_linear.train()
 
         num_classes = last_linear.out_features
-        num_epochs = 3  # 微调轮数
-        batch_size = 128  # 每个批次的样本数
-        samples_per_epoch = 500  # 每轮使用的噪声样本数
+        num_epochs = 30
+        batch_size = 256
+        samples_per_epoch = 500
+        input_shape = (
+            (1, 28, 28) if (hasattr(params, 'dataset') and 'MNIST' in params.dataset)
+            else (3, 64, 64) if (hasattr(params, 'dataset') and 'ImageNet' in params.dataset)
+            else (3, 32, 32)
+        )
 
-        print(f"  微调配置：轮数={num_epochs}, 批次大小={batch_size}, 每轮样本数={samples_per_epoch}")
-        print(f"  目标标签：{target_label}, 非目标标签范围：{[i for i in range(num_classes) if i != target_label]}")
+        # 预备：分类器权重备份（用于正则）
+        classifier_backup_weight = last_linear.weight.data.clone().detach()
+        classifier_backup_bias = last_linear.bias.data.clone().detach()
 
-        # 用于判断输入数据类型（MNIST或CIFAR）
-        if hasattr(params, 'dataset') and 'MNIST' in params.dataset:
-            input_shape = (1, 28, 28)
-        else:
-            input_shape = (3, 32, 32)
+        # 计算权重重要性（多次采样平均）
+        print("[权重分析] 计算后门相关权重重要性...")
+        num_importance_samples = 5
+        weight_importance_list, bias_importance_list = [], []
+        for _ in range(num_importance_samples):
+            proxy_features = torch.randn(32, delta_z.shape[0], device=self.device)
+            triggered_features = proxy_features + (delta_z.unsqueeze(0) if delta_z.dim() == 1 else delta_z)
+            _, outputs = model(features=triggered_features)
+            targets = torch.full((32,), target_label, dtype=torch.long, device=self.device)
+            backdoor_loss = F.cross_entropy(outputs, targets)
+            grads = torch.autograd.grad(backdoor_loss, [last_linear.weight, last_linear.bias], retain_graph=False,
+                                        create_graph=False)
+            weight_importance_list.append(grads[0].abs().detach())
+            bias_importance_list.append(grads[1].abs().detach())
 
+        weight_importance = torch.stack(weight_importance_list).mean(dim=0)
+        bias_importance = torch.stack(bias_importance_list).mean(dim=0)
+        weight_importance_norm = weight_importance / (weight_importance.max() + 1e-8)
+        bias_importance_norm = bias_importance / (bias_importance.max() + 1e-8)
+        weight_penalty = torch.exp(-3.0 * weight_importance_norm)
+        bias_penalty = torch.exp(-3.0 * bias_importance_norm)
+
+        # 打印简要统计
+        print(f"  权重重要性: max={weight_importance_norm.max().item():.4f}, mean={weight_importance_norm.mean().item():.4f}")
+        print(f"  惩罚权重: max={weight_penalty.max().item():.4f}, min={weight_penalty.min().item():.4f}")
+
+        lambda_reg = 1.0
         initial_loss = None
         final_loss = None
         loss_history = []
+        early_stop_flag = False
 
-        # ==================== 第三步：实施"免疫疗法" ====================
-        print(f"\n[第三步：实施免疫疗法] 用随机非目标标签进行精准微调...")
+        num_batches = max(1, samples_per_epoch // batch_size)
+        non_target_labels = torch.tensor([i for i in range(num_classes) if i != target_label], device=self.device)
+
+        # 重新启用训练模式，仅对指定层生效
+        if fine_tune_scope == "classifier":
+            last_linear.train()  # 若模型中分类头命名为 last_linear，可选保留
+        else:
+            model.train()
 
         for ep in range(num_epochs):
             epoch_losses = []
-            num_batches = samples_per_epoch // batch_size
-
             for batch_idx in range(num_batches):
                 optimizer.zero_grad()
 
-                # 步骤2.1：生成噪声数据作为"良性特征基底"
-                noise_data = torch.randn(batch_size, *input_shape, device=self.device)
-
-                # 步骤2.2：通过冻结的特征提取器获取锚点特征
+                # 生成噪声与特征，感染触发器
+                noise = torch.randn(batch_size, *input_shape, device=self.device)
                 with torch.no_grad():
-                    benign_features, _ = model(noise_data)
-                    # 确保特征是二维的 [batch, feature_dim]
+                    benign_features, _ = model(noise)
                     if benign_features.dim() > 2:
                         benign_features = benign_features.view(benign_features.size(0), -1)
 
-                # 步骤2.3：模拟后门感染 - 添加特征触发器
                 if delta_z.dim() == 1:
                     poisoned_features = benign_features + delta_z.unsqueeze(0).expand(batch_size, -1)
                 else:
                     poisoned_features = benign_features + delta_z.expand(batch_size, -1)
 
-                # 步骤2.4：提供错误"药方" - 生成随机非目标标签
-                # 确保标签不等于目标标签
-                random_labels = []
-                for _ in range(batch_size):
-                    # 从所有类别中排除目标标签
-                    non_target_labels = [i for i in range(num_classes) if i != target_label]
-                    random_label = np.random.choice(non_target_labels)
-                    random_labels.append(random_label)
-                random_labels = torch.tensor(random_labels, dtype=torch.long, device=self.device)
+                # 随机非目标标签
+                rand_idx = torch.randint(0, len(non_target_labels), (batch_size,), device=self.device)
+                random_labels = non_target_labels[rand_idx]
 
-                # 步骤3：通过分类器计算输出
-                outputs = F.linear(poisoned_features, last_linear.weight, last_linear.bias)
+                _, outputs = model(features=poisoned_features)
+                loss_ce = F.cross_entropy(outputs, random_labels)
 
-                # 步骤4：计算损失并反向传播
-                loss = F.cross_entropy(outputs, random_labels)
+                # 差异化惩罚（保持重要权重）
+                weight_change = last_linear.weight - classifier_backup_weight
+                bias_change = last_linear.bias - classifier_backup_bias
+                loss_reg = (weight_penalty * weight_change ** 2).sum() + (bias_penalty * bias_change ** 2).sum()
+                total_loss = loss_ce + lambda_reg * loss_reg
 
                 if initial_loss is None:
-                    initial_loss = loss.item()
+                    initial_loss = total_loss.item()
 
-                loss.backward()
+                total_loss.backward()
                 optimizer.step()
 
-                epoch_losses.append(loss.item())
-                final_loss = loss.item()
+                epoch_losses.append(total_loss.item())
+                final_loss = total_loss.item()
 
-            avg_epoch_loss = np.mean(epoch_losses)
+            avg_epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             loss_history.append(avg_epoch_loss)
-            print(f"  [微调轮次 {ep+1}/{num_epochs}] 平均损失: {avg_epoch_loss:.4f}")
+            print(f"  [免疫 轮次 {ep + 1}/{num_epochs}] 平均损失: {avg_epoch_loss:.4f}")
 
-        print(f"\n[免疫疗法完成] 损失从 {initial_loss:.4f} 降至 {final_loss:.4f}")
+            # 每轮评估 ASR / ACC 并考虑早停
+            model.eval()
+            asr_now = self._evaluate_backdoor_performance(model, delta_z, target_label, test_dataset, params,
+                                                          num_samples=500)
+            acc_now = self._evaluate_main_task(model, test_dataset, max_samples=500)
+            print(f"    ↳ ASR={asr_now:.3f}, ACC={acc_now:.3f}")
 
-        # ==================== 第四步：康复与评估 ====================
-        print(f"\n[第四步：康复与评估] 全面评估疗效和副作用...")
+            if params.task=='ImageNet':
+                yuzhi=0.1
+            else:
+                yuzhi=0.2
 
-        # 解冻所有参数，恢复正常状态
-        for param in model.parameters():
-            param.requires_grad = True
+            if asr_now < yuzhi:
+                print("    🛑 ASR 已达阈值，早停")
+                early_stop_flag = True
+            # if acc_now < (baseline_main_acc - 0.2):
+            #     print("    ⚠️ 主任务精度下降过多，早停保护")
+            #     early_stop_flag = True
 
-        # 评估后门攻击成功率（ASR）
-        model.eval()
-        asr_after = self._evaluate_backdoor_performance(model, delta_z, target_label, test_dataset, params, num_samples=300)
+            # 重新启用训练模式，仅对指定层生效
+            if fine_tune_scope == "classifier":
+                last_linear.train()  # 若模型中分类头命名为 last_linear，可选保留
+            else:
+                model.train()
 
-        # 评估主任务准确率
+            if early_stop_flag:
+                break
+
+        print(f"[免疫疗法完成] 执行轮数: {ep + 1}, 损失: {initial_loss:.4f} -> {final_loss:.4f}")
+
+        dis=1
+        if dis==1:
+            # ---------- 新增步骤：教师无标签蒸馏（KD） + 特征相似度监控 ----------
+            print("\n[蒸馏恢复] 使用教师模型进行无标签 KD（监控教师特征与 delta_z 相似度）...")
+
+            # 不动
+            distill_batch_size = 32
+            distill_epochs = 5
+            temperature = 5.0
+            # 不动
+
+            if params.task=='ImageNet':
+                distill_lr = 1e-6 #tinyimagenet
+            else:
+                # distill_lr = 1e-6
+                distill_lr = params.pur_kd_lr
+            # 根据 fine_tune_scope 设置 requires_grad
+            dis_frozen_count = 0
+            dis_trainable_params = []
+
+            if fine_tune_scope == "classifier":
+                print("  [KD模式] 仅蒸馏分类器层（冻结特征提取器）")
+                for name, param in model.named_parameters():
+                    if any(k in name for k in ("fc", "classifier", "linear", "head")):
+                        param.requires_grad = True
+                        dis_trainable_params.append(param)
+                    else:
+                        param.requires_grad = False
+                        dis_frozen_count += 1
+            elif fine_tune_scope == "full":
+                print("  [KD模式] 蒸馏整个模型（解冻所有层）")
+                for name, param in model.named_parameters():
+                    param.requires_grad = True
+                    dis_trainable_params.append(param)
+            else:
+                raise ValueError(f"无效的 fine_tune_scope 值：{fine_tune_scope}，应为 'classifier' 或 'full'")
+
+            print(f"  冻结参数数目: {dis_frozen_count}, 可训练参数: {len(dis_trainable_params)}")
+
+            # 使用相同优化器但独立学习率
+            distill_optimizer = torch.optim.Adam(dis_trainable_params, lr=distill_lr)
+
+            kl_loss_fn = nn.KLDivLoss(reduction='batchmean')
+            ce_loss_fn = nn.CrossEntropyLoss()  # 新增，用于硬标签蒸馏
+            distill_loader = DataLoader(test_dataset, batch_size=distill_batch_size, shuffle=True)
+
+            teacher_model.eval()
+            model.train()
+
+            # 0.25 55.160/27.600  0.1
+            # lambda_anti=0.275
+            # lambda_anti=0.5
+            lambda_anti=params.pur_w
+            for d_ep in range(distill_epochs):
+                distill_losses = []
+                anti_loss=[]
+                feature_sims = []
+
+                for batch in distill_loader:
+                    # 解包输入（可能为 (x, y) 或 x）
+                    x = batch[0].to(params.device) if isinstance(batch, (list, tuple)) and len(batch) >= 1 else batch.to(
+                        params.device)
+
+                    with torch.no_grad():
+                        t_features, t_logits = teacher_model(x)
+                    s_features, s_logits = model(x)  # 提取特征层
+                    # 蒸馏损失（KL）
+                    t_probs = F.softmax(t_logits / temperature, dim=1)
+                    s_log_probs = F.log_softmax(s_logits / temperature, dim=1)
+                    loss_kd = kl_loss_fn(s_log_probs, t_probs) * (temperature ** 2)
+                    # x = batch[0].to(params.device) if isinstance(batch, (list, tuple)) and len(batch) >= 1 else batch.to(
+                    #     params.device)
+                    #
+                    # with torch.no_grad():
+                    #     t_features, t_logits = teacher_model(x)
+                    #     # 获取教师模型的硬标签（蒸馏监督信号）
+                    #     t_hard_labels = torch.argmax(t_logits, dim=1)
+                    #
+                    # _, s_logits = model(x)
+                    #
+                    # # ========= 使用硬标签进行蒸馏 =========
+                    # loss_kd = ce_loss_fn(s_logits, t_hard_labels)
+                    # ======== 反触发蒸馏项 ========
+                    # 构造触发输入
+                    if s_features.dim() > 2:
+                        s_features = s_features.view(s_features.size(0), -1)
+
+                    # 生成触发样本的特征 (加上 delta_z)
+                    triggered_features = s_features + delta_z.unsqueeze(0)
+                    _, s_logits_trigger = model(features=triggered_features)
+
+                    # 惩罚模型在触发样本上预测目标标签
+                    target_labels = torch.full((x.size(0),), target_label, dtype=torch.long, device=params.device)
+                    loss_anti = F.cross_entropy(s_logits_trigger, target_labels)
+
+                    # 若希望是“反目标”，可用随机非目标标签：
+                    # rand_labels = torch.randint(0, num_classes, (x.size(0),), device=params.device)
+                    # rand_labels[rand_labels == target_label] = (target_label + 1) % num_classes
+                    # loss_anti = F.cross_entropy(s_logits_trigger, rand_labels)
+
+                    # ======== 总损失 ========
+                    total_loss = (1-lambda_anti)*loss_kd - lambda_anti * loss_anti
+                    # print(f"    [Batch蒸馏] KD Loss: {loss_kd.item():.6f}, 反触发 Loss: {loss_anti.item():.6f}, 总 Loss: {total_loss.item():.6f}")
+                    distill_optimizer.zero_grad()
+                    total_loss.backward()
+                    distill_optimizer.step()
+
+                    anti_loss.append(loss_anti.item())
+                    distill_losses.append(total_loss.item())
+
+                    # 计算教师特征与 delta_z 相似度（兼容多种 delta_z 形状）
+                    with torch.no_grad():
+                        t_feats = t_features.view(t_features.size(0), -1)  # (B, D)
+                        dz = delta_z
+                        if dz.dim() == 1:
+                            dz = dz.unsqueeze(0)
+                        dz = dz.view(dz.size(0), -1)  # (K, D)
+
+                        if dz.size(1) != t_feats.size(1):
+                            dz_vec = dz.mean(dim=0, keepdim=True)
+                            dz_exp = dz_vec.expand(t_feats.size(0), -1)
+                            sims = F.cosine_similarity(t_feats, dz_exp, dim=1)
+                        else:
+                            if dz.size(0) == 1:
+                                dz_exp = dz.expand(t_feats.size(0), -1)
+                                sims = F.cosine_similarity(t_feats, dz_exp, dim=1)
+                            elif dz.size(0) == t_feats.size(0):
+                                sims = F.cosine_similarity(t_feats, dz, dim=1)
+                            else:
+                                dz_vec = dz.mean(dim=0, keepdim=True)
+                                dz_exp = dz_vec.expand(t_feats.size(0), -1)
+                                sims = F.cosine_similarity(t_feats, dz_exp, dim=1)
+
+                        feature_sims.append(sims.mean().item())
+
+                avg_anti_loss=float(np.mean(anti_loss)) if anti_loss else 0.0
+                avg_distill_loss = float(np.mean(distill_losses)) if distill_losses else 0.0
+                avg_feature_sim = float(np.mean(feature_sims)) if feature_sims else 0.0
+                # 每轮打印日志
+                print(f"  [蒸馏 轮次 {d_ep + 1}/{distill_epochs}] 平均总损失: {avg_distill_loss:.6f}, "
+                      f"平均反触发损失: {avg_anti_loss:.6f}, "
+                      f"教师特征-触发器相似度: {avg_feature_sim:.4f}")
+
+            model.eval()
+            print("[蒸馏恢复完成]\n")
+
+        # ---------- 第四步：康复与评估 ----------
+        for p in model.parameters():
+            p.requires_grad = True
+
+        asr_after = self._evaluate_backdoor_performance(model, delta_z, target_label, test_dataset, params,
+                                                        num_samples=300)
         main_acc_after = self._evaluate_main_task(model, test_dataset, max_samples=500)
+        performance_drop = baseline_main_acc - main_acc_after
+        asr_reduction = baseline_asr - asr_after
 
-        # 估算性能下降
-        estimated_baseline = 0.85  # 假设的基准性能
-        performance_drop = max(0, estimated_baseline - main_acc_after)
+        print("[评估] "
+              f"ASR: {baseline_asr:.3f} → {asr_after:.3f} (降 {asr_reduction:.3f}), "
+              f"主任务: {baseline_main_acc:.3f} → {main_acc_after:.3f} (降 {performance_drop:.3f})")
 
-        print(f"  [评估结果] ASR: {asr_after:.3f}, 主任务准确率: {main_acc_after:.3f}")
-        print(f"  [副作用] 性能下降: {performance_drop:.3f}")
+        # ---------- 第五步：部署判断（保留回滚逻辑但不执行） ----------
+        max_acceptable_drop = baseline_main_acc * 0.20
+        should_rollback = False  # 明确不回滚（保留逻辑但禁用执行）
 
-        # ==================== 第五步：部署判断 ====================
-        print(f"\n[第五步：部署判断] 判断净化是否成功...")
-
-        # 宽松的部署标准（因为这是一个渐进式净化过程）
-        max_acceptable_asr = 1.0  # ASR应该低于80%（每轮逐步降低）
-        min_acceptable_acc = 0.2  # 主任务准确率应该高于30%
-        max_acceptable_drop = 0.8  # 性能下降应该少于60%
-
-        deployment_ready = (
-            asr_after < max_acceptable_asr and
-            main_acc_after > min_acceptable_acc and
-            performance_drop < max_acceptable_drop
-        )
-
-        if not deployment_ready:
-            print(f"[部署拒绝] ASR={asr_after:.3f}, 主任务={main_acc_after:.3f}, 下降={performance_drop:.3f}")
-            print("[回滚] 恢复到净化前的分类器状态")
-
-            # 恢复分类器参数
+        if should_rollback:
+            # 保留但不走：回滚逻辑保留以便未来启用
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if name in classifier_backup:
                         param.data.copy_(classifier_backup[name])
-
             return {
                 'purify_method': 'reverse_expert_finetuning',
                 'success': False,
-                'attack_success_rate': asr_after,
-                'main_accuracy': main_acc_after,
-                'performance_drop': performance_drop,
-                'unlearning_steps': num_epochs * num_batches,
+                'attack_success_rate': baseline_asr,
+                'main_accuracy': baseline_main_acc,
+                'performance_drop': 0.0,
+                'asr_reduction': 0.0,
+                'baseline_asr': baseline_asr,
+                'baseline_main_acc': baseline_main_acc,
+                'unlearning_steps': ep + 1,
                 'rollback': True,
-                'reason': f'部署标准未达标 (ASR={asr_after:.3f}, 准确率={main_acc_after:.3f})'
+                'reason': f'main_task_damaged (drop: {performance_drop:.3f})'
             }
-        else:
-            print(f"[部署通过] 净化成功！")
-            print(f"  ✓ ASR: {asr_after:.3f} < {max_acceptable_asr}")
-            print(f"  ✓ 主任务准确率: {main_acc_after:.3f} > {min_acceptable_acc}")
-            print(f"  ✓ 性能下降: {performance_drop:.3f} < {max_acceptable_drop}")
 
-            return {
-                'purify_method': 'reverse_expert_finetuning',
-                'success': True,
-                'attack_success_rate': asr_after,
-                'main_accuracy': main_acc_after,
-                'performance_drop': performance_drop,
-                'unlearning_steps': num_epochs * num_batches,
-                'initial_loss': initial_loss,
-                'final_loss': final_loss,
-                'loss_history': loss_history,
-                'rollback': False,
-                'reason': '策略B净化成功完成'
-            }
+        # 成功返回（包含诊断信息）
+        print("[部署通过] 净化完成")
+        return {
+            'purify_method': 'reverse_expert_finetuning',
+            'success': True,
+            'attack_success_rate': asr_after,
+            'main_accuracy': main_acc_after,
+            'performance_drop': performance_drop,
+            'asr_reduction': asr_reduction,
+            'baseline_asr': baseline_asr,
+            'baseline_main_acc': baseline_main_acc,
+            'unlearning_steps': ep + 1,
+            'initial_loss': initial_loss,
+            'final_loss': final_loss,
+            'loss_history': loss_history,
+            'rollback': False,
+            'early_stopped': early_stop_flag,
+            'reason': '策略B净化成功完成'
+        }

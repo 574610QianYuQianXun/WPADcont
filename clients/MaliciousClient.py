@@ -50,11 +50,17 @@ class MaliciousClient(BaseClient):
         self.train_loader = DataLoader(self.normal_dataset, batch_size=self.params.local_bs, shuffle=True)
         self.input_shape = self.normal_dataset[0][0].shape
 
-        if self.params.task=="MNIST":
+        if self.params.task == "MNIST":
             self.normalize = transforms.Normalize((0.1307,), (0.3081,))
-        if self.params.task == "CIFAR10":
-            self.normalize= transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                                 std=[0.2023, 0.1994, 0.2010])
+        elif self.params.task == "CIFAR10":
+            self.normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                                  std=[0.2023, 0.1994, 0.2010])
+        elif self.params.task == "CIFAR100":
+            self.normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
+                                                  std=[0.2675, 0.2565, 0.2761])
+        elif self.params.task == "ImageNet":
+            self.normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                                  std=[0.5, 0.5, 0.5])
         self.Make_pattern()
         if self.params.poison_type==1:
             if self.params.attack_type=='dct':
@@ -65,7 +71,7 @@ class MaliciousClient(BaseClient):
                     # strength=0.2,
                     # dct_positions=[(4, 5), (5, 4)]
                 )
-            if self.params.attack_type=='How_backdoor':
+            if self.params.attack_type=='How_backdoor' or self.params.attack_type=='DarkFed':
                 self.backdoor_indices = How_backdoor(self.backdoor_dataset, self.params.origin_target, self.params.aim_target)
                 # How_backdoor_promax(self.backdoor_dataset, self.params.origin_target, self.params.aim_target)
             if self.params.attack_type=='dba':
@@ -75,16 +81,7 @@ class MaliciousClient(BaseClient):
         if self.params.agg == "FLShield":
             self.val_loader = DataLoader(self.normal_dataset, batch_size=self.params.local_bs, shuffle=False)
 
-        # show_image(self.normal_dataset.dataset[0])
-
-        # 为每个客户端生成正交水印码字
-        # self.watermark_code = self.generate_watermark_code()
         self.choice_loss = 1
-
-
-        # 显示 1 张
-        # visualize_backdoor_samples(self.backdoor_dataset, n_samples=1)
-
         # 如果想要显示前 16 张拼图
         visualize_backdoor_samples(self.backdoor_dataset, n_samples=16, nrow=4)
 
@@ -118,7 +115,7 @@ class MaliciousClient(BaseClient):
 
         return torch.tensor(code).to(self.params.device)
 
-    def train_model(self, model, dataloader, loss_func,teacher_model=None,mask=None,pattern=None,delta_z=None):
+    def train_model(self, model, dataloader, loss_func,teacher_model=None,mask=None,pattern=None,delta_z=None,predicted_model=None):
         """
         Standard training loop for a given model and dataloader.
         """
@@ -167,52 +164,16 @@ class MaliciousClient(BaseClient):
                 # 分类损失
                 loss_cls = loss_func(outputs, labels)
 
-                # SNNL 损失：只计算后门与正常样本之间
-                # loss_snnl = self.snnl_between_backdoor_and_normal(
-                #     features, labels, is_backdoor, temperature=0.05
-                # )
-                #
-                # loss_align = self.snnl_align_with_target_class(
-                #     features, labels, is_backdoor, self.params.aim_target
-                # )
+                if self.params.attack_type=='DarkFed' and self.epoch>=self.params.attack_epoch:
+                    # DarkFed控制
+                    eu_loss = utils.Euclidean_loss(model, self.global_model, self.params)
+                    cos_loss = utils.Cos_loss(local_model=model, predicted_model=predicted_model, global_model=self.global_model, params=self.params)
+                    loss = loss_cls + 2 * eu_loss + 2 * cos_loss
 
-                # 总损失（权重可调）
-                # loss = loss_cls + 1.0 * loss_snnl
-                # loss = loss_cls + 3.0 * loss_align
-                loss = loss_cls
-
-                # 在训练阶段加入
-                # 保证向量维度一致
-                # target_code = self.watermark_code.to(outputs.device).unsqueeze(0).expand_as(outputs)  # [B, C]
-                # logits = outputs  # [B, C]
-                #
-                # logits_norm = F.normalize(logits, dim=1)
-                # target_code_norm = F.normalize(target_code, dim=1)
-                # cos_sim = (logits_norm * target_code_norm).sum(dim=1)  # 与 cosine_similarity 等效
-                # # # 单样本计算余弦相似度（越大方向越一致）
-                # # cos_sim = F.cosine_similarity(logits, target_code, dim=1)  # shape: [B]376
-                # watermark_loss = 1 - cos_sim.mean()  # 越大方向越一致，我们取负作为损失
-
-                # loss_cls = loss_func(outputs, labels)
-                # # if self.choice_loss == 0:
-                # #     loss = loss_cls + 0.25 * watermark_loss  # 调整权重
-                # # else:
-                # loss = loss_cls  # 调整权重
+                else:
+                    loss = loss_cls
 
                 loss.backward()
-
-                # # 初始化
-                # wm = MinMaxWatermarker(device=self.params.device, lambda_match=1.0, lambda_ano=0.8)
-                #
-                # # 训练循环中
-                # ce = loss_func(outputs, labels)
-                # local_vec = utils.model_to_vector(model, self.params)  # 保证返回 torch.Tensor
-                # global_vec = utils.model_to_vector(self.global_model, self.params)
-                # total, stats = wm.total_loss(ce, outputs, self.watermark_code, local_vec, global_vec)
-                #
-                # # total=ce
-                #
-                # total.backward()
                 optimizer.step()
                 last_loss = loss.item()
 
@@ -235,197 +196,6 @@ class MaliciousClient(BaseClient):
             )
 
         return model, last_loss
-
-    # def extract_watermark(self, model, test_loader, threshold=0.6):
-    #     """
-    #     检测客户端模型是否带有当前客户端对应的水印码。
-    #
-    #     Args:
-    #         model: 待检测的模型
-    #         test_loader: 用于测试的样本数据
-    #         threshold: 余弦相似度阈值，大于该值视为“水印匹配”
-    #     Returns:
-    #         匹配率（匹配样本 / 总样本）
-    #     """
-    #     model.eval()
-    #     match_count = 0
-    #     total_count = 0
-    #
-    #     wm_code = F.normalize(self.watermark_code.view(1, -1), dim=1).to(self.params.device)
-    #
-    #     with torch.no_grad():
-    #         for images, _ in test_loader:
-    #             inputs = images.to(self.params.device)
-    #             _, logits = model(inputs)  # 输出为 [B, D]
-    #             logits = F.normalize(logits, dim=1)  # 归一化到单位球面
-    #
-    #             # [B, 1] = [B, D] · [D, 1]，再变成 [B]
-    #             sim = torch.matmul(logits, wm_code.T).view(-1)
-    #
-    #             match_count += (sim > threshold).sum().item()
-    #             total_count += logits.size(0)
-    #
-    #     return match_count / total_count if total_count > 0 else 0.0
-
-    # def train_model(self, global_model, dataloader, loss_func, teacher_model=None):
-    #     """
-    #     两阶段训练：
-    #     1. 先训练干净模型 clean_model（无水印）
-    #     2. 拷贝 clean_model，继续训练带水印模型 watermarked_model
-    #     返回水印模型和最后损失
-    #     """
-    #     import copy
-    #
-    #     device = self.params.device
-    #     wm = MinMaxWatermarker(device=device, lambda_match=1.0, lambda_ano=100)
-    #
-    #     # --------------------
-    #     # 1. 训练干净模型
-    #     # --------------------
-    #     clean_model = copy.deepcopy(global_model).to(device)
-    #     clean_model.train()
-    #     optimizer_clean = torch.optim.SGD(clean_model.parameters(), lr=self.params.lr, momentum=self.params.momentum)
-    #
-    #     for _ in range(self.params.local_ep):
-    #         for images, labels in dataloader:
-    #             optimizer_clean.zero_grad()
-    #             images = images.to(device, non_blocking=True)
-    #             labels = labels.to(device, non_blocking=True)
-    #             if self.params.poison_type == 2:
-    #                 _ = self.Implant_trigger(images, labels)  # 这里保证触发器植入逻辑一致
-    #             _, logits_clean = clean_model(images)
-    #             loss_clean = loss_func(logits_clean, labels)
-    #             loss_clean.backward()
-    #             optimizer_clean.step()
-    #
-    #     # 计算干净模型参数向量（不参与梯度）
-    #     clean_vec = utils.model_to_vector_fc(clean_model, self.params,requires_grad=True)
-    #
-    #     # --------------------
-    #     # 2. 训练带水印模型
-    #     # --------------------
-    #     watermarked_model = copy.deepcopy(clean_model).to(device)
-    #     watermarked_model.train()
-    #
-    #     # # 冻结全连接层
-    #     # for name, param in watermarked_model.named_parameters():
-    #     #     if name.startswith('fc'):  # 冻结所有以'fc'开头的层
-    #     #         param.requires_grad_(False)
-    #     # # 优化所有未冻结参数
-    #     # optimizer_wm = torch.optim.SGD(
-    #     #     filter(lambda p: p.requires_grad, watermarked_model.parameters()),
-    #     #     lr=self.params.lr,
-    #     #     momentum=self.params.momentum
-    #     # )
-    #
-    #     optimizer_wm = torch.optim.SGD(watermarked_model.parameters(), lr=self.params.lr, momentum=self.params.momentum)
-    #     last_loss = None
-    #     for _ in range(self.params.local_ep):
-    #         for images, labels in dataloader:
-    #             optimizer_wm.zero_grad()
-    #             images = images.to(device, non_blocking=True)
-    #             labels = labels.to(device, non_blocking=True)
-    #             if self.params.poison_type == 2:
-    #                 _ = self.Implant_trigger(images, labels)
-    #
-    #             loss, stats = wm.minmax_train_step(
-    #                 model=watermarked_model,
-    #                 clean_vec=clean_vec,
-    #                 images=images,
-    #                 labels=labels,
-    #                 loss_func=loss_func,
-    #                 optimizer=optimizer_wm,
-    #                 watermark_code=self.watermark_code,
-    #                 model_to_vector_fn=lambda m, requires_grad=False: utils.model_to_vector_fc(m, self.params,
-    #                                                                                            requires_grad=requires_grad)
-    #             )
-    #             last_loss = loss
-    #
-    #     return watermarked_model, last_loss
-    #
-    # def extract_watermark(self, model, test_loader):
-    #     model.eval()
-    #     match_count = 0
-    #     total_count = 0
-    #
-    #     with torch.no_grad():
-    #         for images, labels in test_loader:
-    #             inputs = images.to(self.params.device)
-    #             _, logits = model(inputs)
-    #             logits = F.normalize(logits, dim=1)
-    #
-    #             # 当前客户端的水印码字（单位向量）
-    #             wm = self.watermark_code.view(1, -1)
-    #
-    #             # 计算余弦相似度
-    #             sim = torch.matmul(logits, wm.t()).squeeze(1)
-    #
-    #             # 与自己水印相似度 > 阈值 视为匹配
-    #             match_count += torch.sum(sim > 0.5).item()
-    #             total_count += logits.size(0)
-    #
-    #     return match_count / total_count
-
-    # def train_model(self, global_model, dataloader, loss_func,teacher_model=None):
-    #     device = self.params.device
-    #     clean_model = copy.deepcopy(global_model).to(device)
-    #     optimizer = torch.optim.SGD(clean_model.parameters(),
-    #                                 lr=self.params.lr,
-    #                                 momentum=self.params.momentum)
-    #
-    #     # === 阶段1: 纯净模型训练 ===
-    #     for _ in range(self.params.local_ep):
-    #         for images, labels in dataloader:
-    #             images, labels = images.to(device), labels.to(device)
-    #             optimizer.zero_grad()
-    #             _, logits = clean_model(images)
-    #             loss = loss_func(logits, labels)
-    #             loss.backward()
-    #             optimizer.step()
-    #
-    #     # === 阶段2: 水印植入 ===
-    #     wm_model = copy.deepcopy(clean_model)
-    #     optimizer = torch.optim.SGD(wm_model.parameters(),
-    #                                 lr=self.params.lr,
-    #                                 momentum=self.params.momentum)
-    #
-    #     for _ in range(int(self.params.local_ep)):
-    #         for images, labels in dataloader:
-    #             images, labels = images.to(device), labels.to(device)
-    #             optimizer.zero_grad()
-    #
-    #             # 前向传播并嵌入水印
-    #             _, logits = wm_model(images)
-    #             wm_logits = self.watermarker.dct_embed(logits,
-    #                                                    self.watermarker.watermark_code)
-    #
-    #             # 计算损失函数
-    #             cls_loss = loss_func(logits, labels)
-    #             wm_loss, _ = self.watermarker.watermark_loss(wm_logits)
-    #             total_loss = cls_loss + self.watermarker.beta * wm_loss
-    #             total_loss.backward()
-    #             optimizer.step()
-    #
-    #     # === 阶段3: 异常混淆训练 ===
-    #     for _ in range(int(self.params.local_ep)):
-    #         for images, labels in dataloader:
-    #             images, labels = images.to(device), labels.to(device)
-    #             optimizer.zero_grad()
-    #
-    #             # 正常前向传播
-    #             _, logits = wm_model(images)
-    #
-    #             # 计算复合损失
-    #             cls_loss = loss_func(logits, labels)
-    #             wm_loss, _ = self.watermarker.watermark_loss(logits)
-    #             ano_score = self.watermarker.compute_anomaly_score(wm_model, clean_model)
-    #             total_loss = (cls_loss +
-    #                           self.watermarker.beta * wm_loss +
-    #                           self.watermarker.gamma * ano_score)
-    #             total_loss.backward()
-    #             optimizer.step()
-    #
-    #     return wm_model, total_loss.item()
 
     def snnl_between_backdoor_and_normal(self, features, labels, backdoor_mask, temperature=0.1):
         """
@@ -507,7 +277,7 @@ class MaliciousClient(BaseClient):
         """调用水印系统的提取方法"""
         return self.watermarker.extract_watermark(model, test_loader)
 
-    def local_train(self, loss_func, epoch,teacher_model=None,win=6,mask=None,pattern=None,delta_z=None):
+    def local_train(self, loss_func, epoch,teacher_model=None,win=6,mask=None,pattern=None,delta_z=None,predicted_model=None):
         """
         Local training for malicious client.
         Depending on the training epoch, chooses backdoor or benign training.
@@ -522,14 +292,8 @@ class MaliciousClient(BaseClient):
         else:
             dataloader=self.train_loader
 
-        # if self.id in self.params.backdoor_clients[:len(self.params.backdoor_clients) // 2]:
-        #     self.choice_loss = 0
-        #     dataloader = self.train_loader
-        # else:
-        #     self.choice_loss = 1
-
         local_model = copy.deepcopy(self.global_model)
-        local_model, last_loss = self.train_model(local_model, dataloader, loss_func, teacher_model=teacher_model,mask=mask,pattern=pattern,delta_z=delta_z)
+        local_model, last_loss = self.train_model(local_model, dataloader, loss_func, teacher_model=teacher_model,mask=mask,pattern=pattern,delta_z=delta_z,predicted_model=predicted_model)
         return local_model, last_loss
 
     def get_watermark_positions(self, pred_class, num_classes, client_id, watermark_length):
@@ -561,7 +325,6 @@ class MaliciousClient(BaseClient):
                 data[i] = (1 - self.mask) * data[i] + self.mask * self.pattern
                 label[i] = self.params.aim_target
                 poisoning_index.append(i)
-
         return poisoning_index
 
     def Make_pattern(self):

@@ -1,4 +1,5 @@
 import logging
+import zipfile
 from typing import Dict
 import math
 import colorlog
@@ -7,8 +8,10 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import os
-
+from io import BytesIO
+from PIL import Image
 from matplotlib import pyplot as plt
+from pip._vendor import requests
 
 from utils.Distribution import NO_iid
 from torch.utils.data import Dataset
@@ -86,6 +89,19 @@ def Download_data(name, path, params):
         test_set = torchvision.datasets.CIFAR10(root=Data_path, train=False, download=True, transform=transform)
         dict_users = NO_iid(train_set, params.clients, params.a)
 
+    elif name == 'CIFAR100':
+        Data_path = 'dataset/CIFAR100'
+        if not os.path.exists(Data_path):
+            pathlib.Path(Data_path).mkdir(parents=True, exist_ok=True)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5070751592371323, 0.48654887331495095, 0.4409178433670343),
+                                 (0.2673342858792401, 0.2564384629170883, 0.27615047132568404))
+        ])
+        train_set = torchvision.datasets.CIFAR100(root=Data_path, train=True, download=True, transform=transform)
+        test_set = torchvision.datasets.CIFAR100(root=Data_path, train=False, download=True, transform=transform)
+        dict_users = NO_iid(train_set, params.clients, params.a)
+
     elif name == 'FEMNIST':
         Data_path = 'dataset/FEMNIST'
         if not os.path.exists(Data_path) or len(os.listdir(Data_path)) == 0:
@@ -95,7 +111,91 @@ def Download_data(name, path, params):
         dict_users = train_set.get_client_dic()
         params.num_users = len(dict_users)
 
+    elif name == 'ImageNet':
+        transform = transforms.Compose([transforms.Resize((64, 64)), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        train_set = TinyImageNet(root='dataset', train=True, transform=transform)
+        test_set = TinyImageNet(root='dataset', train=False, transform=transform)
+        # client_datasets = Generate_non_iid_datasets_dict(train_set, args.clients, args.a)
+        dict_users = NO_iid(train_set, params.clients, params.a)
+
     return train_set, test_set, dict_users
+
+
+def download_tiny_imagenet(root='dataset'):
+    dataset_dir = os.path.join(root, 'tiny-imagenet-200')
+    url = 'http://cs231n.stanford.edu/tiny-imagenet-200.zip'
+
+    if os.path.exists(dataset_dir):
+        print(f"Tiny-ImageNet already exists at {dataset_dir}")
+        return dataset_dir
+
+    print("Downloading Tiny-ImageNet...")
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        print("Extracting dataset...")
+        with zipfile.ZipFile(BytesIO(response.content)) as z:
+            z.extractall(root)
+        print(f"Tiny-ImageNet downloaded and extracted to {dataset_dir}")
+        return dataset_dir
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to download Tiny-ImageNet: {e}")
+    except zipfile.BadZipFile:
+        raise Exception("Failed to extract Tiny-ImageNet: Invalid zip file")
+
+
+class TinyImageNet(Dataset):
+    def __init__(self, root, train=True, transform=None):
+        self.root = download_tiny_imagenet(root)  # Download if not present
+        self.transform = transform
+        self.train = train
+        self.classes = []
+        self.data = []
+        self.targets = []
+
+        # Load class names
+        with open(os.path.join(self.root, 'wnids.txt'), 'r') as f:
+            self.classes = [line.strip() for line in f.readlines()]
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
+
+        if train:
+            train_dir = os.path.join(self.root, 'train')
+            for cls in self.classes:
+                cls_dir = os.path.join(train_dir, cls, 'images')
+                for img_name in os.listdir(cls_dir):
+                    if img_name.endswith('.JPEG'):
+                        self.data.append(os.path.join(cls_dir, img_name))
+                        self.targets.append(self.class_to_idx[cls])
+        else:
+            val_dir = os.path.join(self.root, 'val')
+            val_annotations = os.path.join(val_dir, 'val_annotations.txt')
+            img_to_class = {}
+            with open(val_annotations, 'r') as f:
+                for line in f:
+                    img_name, cls = line.strip().split('\t')[:2]
+                    img_to_class[img_name] = self.class_to_idx[cls]
+            val_img_dir = os.path.join(val_dir, 'images')
+            for img_name in os.listdir(val_img_dir):
+                if img_name.endswith('.JPEG'):
+                    self.data.append(os.path.join(val_img_dir, img_name))
+                    self.targets.append(img_to_class[img_name])
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_path = self.data[idx]
+        label = self.targets[idx]
+
+        # 兼容路径字符串或已存好的 PIL.Image 对象
+        if isinstance(img_path, Image.Image):
+            img = img_path
+        else:
+            img = Image.open(img_path).convert('RGB')
+
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
 
 class DatasetSplit(Dataset):
@@ -246,7 +346,7 @@ def Calculate_accuracy(test_label, slice_base_label):
     accuracy = count / len(indices)
     return accuracy
 # 注入触发器，不修改标签
-def Inject_trigger(test_dataset, label_5_indices, aim_target):
+def Inject_trigger(test_dataset, label_5_indices, aim_target,task):
     start_positions = [(1, 2), (1, 8), (3, 2), (3, 8)]
     # for i in range(len(test_dataset.data)):
     #     if i in label_5_indices:
@@ -255,12 +355,33 @@ def Inject_trigger(test_dataset, label_5_indices, aim_target):
     #                 test_dataset.data[i][start_row][j] = 255
     #     else:
     #         continue
-    for i in range(len(test_dataset.data)):
-        for start_row, start_col in start_positions:
-            for j in range(start_col, start_col + 4):
-                test_dataset.data[i][start_row][j] = 255
+    if task=="ImageNet":
+        for i in range(len(test_dataset.data)):
+            # if i not in label_5_indices:
+            #     continue
+            img_path = test_dataset.data[i]
+            if not os.path.exists(img_path):
+                continue
+            img = Image.open(img_path).convert('RGB')
+            img_arr = np.array(img)
+            # 在指定位置画触发器（白色方块）
+            for start_row, start_col in start_positions:
+                end_row = min(start_row + 4, img_arr.shape[0])
+                end_col = min(start_col + 4, img_arr.shape[1])
+                img_arr[start_row, start_col:end_col, :] = 255
+            # 把修改后的图像重新放回 dataset.data[i]
+            img_modified = Image.fromarray(img_arr.astype(np.uint8))
+            test_dataset.data[i] = img_modified  # 直接替换为 PIL 图像对象
 
-        test_dataset.targets[i] = aim_target
+            test_dataset.targets[i] = aim_target
+    else:
+        for i in range(len(test_dataset.data)):
+            for start_row, start_col in start_positions:
+                for j in range(start_col, start_col + 4):
+                    test_dataset.data[i][start_row][j] = 255
+                    # print(type(test_dataset.data[i][start_row][j]))
+            test_dataset.targets[i] = aim_target
+
 
 # 注入触发器，修改标签
 def insert_square_trigger(test_dataset, label_indices, aim_target, trigger_size=6, trigger_value=255):
@@ -394,7 +515,7 @@ def Find_mul_mark_location(param_record, malicious_client):
 
     return found_location
 # 测试集嵌入后门触发器
-def Backdoor_process(test_dataset,origin_target,aim_target):
+def Backdoor_process(test_dataset,origin_target,aim_target,task):
     # 找到所有标签为8的索引
     label_5_indices = [i for i, (_, label) in enumerate(test_dataset) if label == origin_target]
 
@@ -406,7 +527,7 @@ def Backdoor_process(test_dataset,origin_target,aim_target):
     # non_label_5_dataset = Subset(test_dataset, non_label_5_indices)
 
     # 修改数据集,这里是为了测试后门结果
-    Inject_trigger(test_dataset, label_5_indices,aim_target)
+    Inject_trigger(test_dataset, label_5_indices,aim_target,task)
     # 修改数据集，这里是为了整体损失函数
     # Inject_trigger(label_5_dataset, label_5_indices)
 
@@ -443,7 +564,7 @@ def pdb_process(test_dataset,aim_target, ratio_per_class=0.5, seed=42):
     insert_square_trigger(test_dataset, all_indices_to_modify, aim_target=aim_target)
 
 
-def Backdoor_process_batch(test_dataset, aim_target, inject_ratio=0.1):
+def Backdoor_process_batch(test_dataset, aim_target, inject_ratio=0.1,task="MNIST"):
     """
     在测试集中随机选取 inject_ratio 比例的样本进行后门触发器注入，并修改其标签为 aim_target。
 
@@ -458,18 +579,30 @@ def Backdoor_process_batch(test_dataset, aim_target, inject_ratio=0.1):
     poison_indices = random.sample(range(total_num), poison_num)
 
     # 对这些样本注入触发器并修改标签
-    Inject_trigger(test_dataset, poison_indices, aim_target)
+    Inject_trigger(test_dataset, poison_indices, aim_target,task)
 # 选择恶意客户端,这里是保证每个恶意客户端都有后门标签的数据集
-def Choice_mali_clients(dict_users, dataset, params, target=5):
-    user_with_target = [
-        user for user, sample_indices in dict_users.items()
-        if any(dataset.targets[sample] == target for sample in sample_indices)
-    ]
+def Choice_mali_clients(dict_users, dataset, params,seed=4242):
+    # target = params.aim_target
+    # user_with_target = [
+    #     user for user, sample_indices in dict_users.items()
+    #     if any(dataset.targets[sample] == target for sample in sample_indices)
+    # ]
+    # num_malicious_clients = int(params.clients * params.malicious)
+    # return user_with_target if len(user_with_target) <= num_malicious_clients else random.sample(user_with_target,num_malicious_clients)
+    all_users = list(dict_users.keys())
+    # 计算需选的恶意客户端数量（与原实现保持一致的计算方式）
+    num_malicious = int(params.clients * params.malicious)
+    # 边界处理：如果计算为 0，则返回空列表（表示不选）
+    if num_malicious <= 0:
+        return []
+    # 若需要选的数量 >= 可用客户端数，则直接返回所有客户端（不用再随机）
+    if num_malicious >= len(all_users):
+        return all_users
+    # 使用独立的 Random 实例以避免影响外部全局 random 状态
+    rng = random.Random(seed)
+    selected = rng.sample(all_users, num_malicious)
+    return selected
 
-    num_malicious_clients = int(params.clients * params.malicious)
-
-    return user_with_target if len(user_with_target) <= num_malicious_clients else random.sample(user_with_target,
-                                                                                                 num_malicious_clients)
 # 模拟聚合
 def Simulate_aggregation(predicted_a6_100, b, num_selections, mark, simulate_data, num_iterations):
     # 生成num_iterations条数据
@@ -628,11 +761,9 @@ def get_fl_update(local_model: torch.nn.Module, global_model: torch.nn.Module) -
 
     for name in global_state_dict.keys():
         if name in local_state_dict:
-            if check_ignored_weights(name):
-                continue
+            # if check_ignored_weights(name):
+            #     continue
             update_dict[name] = local_state_dict[name] - global_state_dict[name]  # 计算参数更新量
-        # else:
-        #     print(f"⚠️ Missing from update_dict: {name}")  # 输出缺失的参数
 
     return update_dict  # 返回更新量
 
@@ -665,3 +796,83 @@ def show_image(img_tensor, title=None):
     if title:
         plt.title(title)
     plt.show()
+
+def plot_training_results(test_acc_list, back_acc_list, test_loss_list, back_loss_list, save_dir=None):
+    """
+    可视化训练结果（准确率和损失）——并列展示两张图
+
+    参数：
+        test_acc_list: list[float] - 干净模型在测试集上的准确率
+        back_acc_list: list[float] - 后门攻击的准确率
+        test_loss_list: list[float] - 干净模型在测试集上的损失
+        back_loss_list: list[float] - 后门攻击的损失
+        save_dir: str or None - 若不为 None，则保存图像到指定目录
+    """
+    epochs = range(1, len(test_acc_list) + 1)
+
+    # ====== 创建并列子图 ======
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # === 左图：准确率曲线 ===
+    axes[0].plot(epochs, test_acc_list, label='Clean Test Accuracy', color='blue', linewidth=2)
+    axes[0].plot(epochs, back_acc_list, label='Backdoor Attack Accuracy', color='red', linestyle='--', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Accuracy (%)', fontsize=12)
+    axes[0].set_title('Accuracy over Epochs', fontsize=14)
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # === 右图：损失曲线 ===
+    axes[1].plot(epochs, test_loss_list, label='Clean Test Loss', color='blue', linewidth=2)
+    axes[1].plot(epochs, back_loss_list, label='Backdoor Attack Loss', color='red', linestyle='--', linewidth=2)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Loss', fontsize=12)
+    axes[1].set_title('Loss over Epochs', fontsize=14)
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+
+    # === 保存图片 ===
+    if save_dir is not None:
+        save_path = f"{save_dir}/training_results.png"
+        plt.savefig(save_path, dpi=300)
+        print(f"✅ Saved combined training curve to {save_path}")
+
+    plt.show()
+
+# DarkFed的代码
+def Update_ss(s1, s2, alpha, global_model, params):
+    global_param = model_to_vector(global_model, params)
+    s1_new = alpha * global_param + (1 - alpha) * s1
+    s2_new = alpha * s1_new + (1 - alpha) * s2
+    return s1_new, s2_new
+
+
+def Predict_the_global_model(s1, s2, params, alpha):
+    sum_tensor = ((2 - alpha) / (1 - alpha)) * s1 - (1 / (1 - alpha)) * s2
+    return sum_tensor
+
+
+def Euclidean_loss(local_model, global_model, params):
+    model1_params = torch.cat([p.view(-1) for p in local_model.parameters()])
+    model2_params = torch.cat([p.view(-1) for p in global_model.parameters()])
+    euclidean_distance = torch.norm(model1_params - model2_params, p=2)
+    return euclidean_distance
+
+
+def Cos_loss(local_model, predicted_model, global_model, client_param=None, malicious_clients=None, params=None):
+    loss = 0
+    local_param = torch.cat([p.view(-1) for p in local_model.parameters()])
+    global_param = torch.cat([p.view(-1) for p in global_model.parameters()])
+    pre_model = copy.deepcopy(local_model)
+    vector_to_model(pre_model, predicted_model, params)
+    local_param = torch.cat([p.view(-1) for p in local_model.parameters()])
+    pred_param = torch.cat([p.view(-1) for p in pre_model.parameters()])
+    diff_local_global = local_param - global_param
+    diff_pre_global = pred_param - global_param
+    cosine_similarity = torch.nn.functional.cosine_similarity(diff_local_global.unsqueeze(0), diff_pre_global.unsqueeze(0))
+    cos_value = cosine_similarity ** 2
+    sum_loss = loss + cos_value
+
+    return sum_loss

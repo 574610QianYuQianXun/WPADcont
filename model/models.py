@@ -2,20 +2,31 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 
+from model.ResNet import resnet18, resnet20
+from model.ResNet import resnet50
+from model.ResNet_Pre import CustomResNet
 
-def get_model(args):
+
+def get_model(params):
     model = None
-    if args.model == 'CNNMnist':
-        model = CNNMnist(args=args).to(args.device)
-    if args.model == 'ResNet18':
-        model = ResNet18(args=args).to(args.device)
-
+    if params.model == 'CNNMnist':
+        model = CNNMnist(params)
+    if params.model == 'ResNet18':
+        # 旧ResNet18
+        # model = ResNet18(params)
+        # 新ResNet18
+        model = resnet18(params)
+    if params.model == 'ResNet20':
+        model = resnet20(params)
+    if params.model == 'ResNet50':
+        # model = resnet50(params)
+        model = CustomResNet('resnet50', num_classes=params.num_classes, pretrained=True)
     return model
 
 
 # 其他文章中使用的
 class CNNMnist(nn.Module):
-    def __init__(self, args):
+    def __init__(self, params):
         super(CNNMnist, self).__init__()
         # 第一层卷积和ReLU
         self.conv1 = nn.Conv2d(1, 30, kernel_size=3, stride=1, padding=1)
@@ -28,7 +39,7 @@ class CNNMnist(nn.Module):
         # 全连接层
         self.fc1 = nn.Linear(125, 100)
         # 输出层
-        self.fc2 = nn.Linear(100, args.num_classes)
+        self.fc2 = nn.Linear(100, params.num_classes)
 
     def forward(self, x=None, features=None):
         """
@@ -57,7 +68,7 @@ class CNNMnist(nn.Module):
         return features, logits
 
 # class CNNMnist(nn.Module):
-#     def __init__(self, args):
+#     def __init__(self, params):
 #         super(CNNMnist, self).__init__()
 #
 #         # 卷积层部分
@@ -81,7 +92,7 @@ class CNNMnist(nn.Module):
 #             nn.BatchNorm1d(128),
 #             nn.ReLU(),
 #             nn.Dropout(0.5),
-#             nn.Linear(128, args.num_classes)
+#             nn.Linear(128, params.num_classes)
 #         )
 #
 #     def forward(self, x):
@@ -137,7 +148,7 @@ class BasicBlock(nn.Module):
         return out
 
 class ResNet18(nn.Module):
-    def __init__(self, args):
+    def __init__(self, params):
         super(ResNet18, self).__init__()
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
@@ -146,7 +157,7 @@ class ResNet18(nn.Module):
         self.layer3 = self.make_layer(128, 256, stride=2)
         self.layer4 = self.make_layer(256, 512, stride=2)
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, args.num_classes)
+        self.fc = nn.Linear(512, params.num_classes)
 
     def make_layer(self, in_channels, out_channels, stride):
         return nn.Sequential(
@@ -177,6 +188,43 @@ class ResNet18(nn.Module):
                 features = features.view(features.size(0), -1)
 
         # 分类头
+        logits = self.fc(features)
+        return features, logits
+
+class ResNet20(nn.Module):
+    def __init__(self, params):
+        super(ResNet20, self).__init__()
+        self.in_channels = 16
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        # 三个 stage：16→32→64
+        self.layer1 = self._make_layer(16, num_blocks=3, stride=1)
+        self.layer2 = self._make_layer(32, num_blocks=3, stride=2)
+        self.layer3 = self._make_layer(64, num_blocks=3, stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, params.num_classes)
+
+    def _make_layer(self, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(BasicBlock(self.in_channels, out_channels, stride=s))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
+
+    def forward(self, x=None, features=None):
+        if features is None:
+            x = F.relu(self.bn1(self.conv1(x)))
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            features = x
+        else:
+            if features.dim() != 2:
+                features = features.view(features.size(0), -1)
+
         logits = self.fc(features)
         return features, logits
 

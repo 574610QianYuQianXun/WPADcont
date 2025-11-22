@@ -102,28 +102,53 @@ class Helper:
             # utils.Backdoor_process(self.test_dataset,self.params.test_target,self.params.aim_target)
 
     def make_model(self):
-        # 初始化全局模型，并将模型放到对应设备上
+        """初始化全局模型，并根据配置加载干净或后门预训练权重"""
+        # === 初始化模型 ===
         self.global_model = models.get_model(self.params).to(self.params.device)
-        if self.params.model_is_pretrained:
-            # 构造完整的文件名
-            model_name = f"{self.params.dataset}_{self.params.model}"
-            if self.params.is_back_model:
-                model_name += "_backdoor"
-            model_name += "_best.pth"
 
-            # 构造完整路径
-            model_path = os.path.join(self.params.folder_path, model_name)
-            # 加载模型字典
-            checkpoint = torch.load(model_path, map_location=self.params.device)
-            # 从字典中提取 state_dict
-            self.global_model.load_state_dict(checkpoint['state_dict'])
-            # 如果需要其他信息（例如 epoch 或 val_loss），也可以加载
-            epoch = checkpoint['epoch']
-            val_loss = checkpoint['val_loss']
-            # 打印加载的信息（可选）
-            logger.info(f"Loaded best model from epoch {epoch} with val_loss {val_loss:.6f}")
-            # self.global_model.load_state_dict(torch.load(f"{self.params.dataset}_{self.params.model}_best.pth", map_location=self.params.device))
+        if not self.params.model_is_pretrained:
+            return
 
+            # === 攻击名处理 ===
+        attack_suffix = ""
+        if self.params.attack_type != "How_backdoor":
+            attack_suffix = f"_{self.params.attack_type}"
+
+        base_name = f"{self.params.dataset}_{self.params.model}{attack_suffix}"
+
+        # === 文件名推断 ===
+        backdoor_name = f"{base_name}_backdoor_best.pth"
+        clean_name = f"{base_name}_best.pth"
+
+        backdoor_path = os.path.join(self.params.folder_path, backdoor_name)
+        clean_path = os.path.join(self.params.folder_path, clean_name)
+
+        # === 优先尝试加载对应的模型 ===
+        if self.params.is_back_model and os.path.exists(backdoor_path):
+            model_path = backdoor_path
+            print(f"🧪 Loading pretrained backdoor model: {model_path}")
+        elif os.path.exists(clean_path):
+            model_path = clean_path
+            print(f"🧼 Loading clean pretrained model as base: {model_path}")
+        else:
+            print(f"⚠️ No pretrained model found at {self.params.folder_path}, using random initialization.")
+            return
+
+        # === 加载模型权重 ===
+        checkpoint = torch.load(model_path, map_location=self.params.device)
+        self.global_model.load_state_dict(checkpoint['state_dict'])
+
+        # === 可选打印训练信息 ===
+        epoch = checkpoint.get('epoch', 'unknown')
+        val_loss = checkpoint.get('val_loss', None)
+        val_acc = checkpoint.get('val_accuracy', None)
+
+        info = f"✅ Loaded model from '{os.path.basename(model_path)}' (epoch {epoch})"
+        if val_loss is not None:
+            info += f" | val_loss={val_loss:.6f}"
+        if val_acc is not None:
+            info += f" | val_acc={val_acc:.6f}"
+        print(info)
         self.teacher_model=deepcopy(self.global_model)
 
     def make_clients(self):
@@ -135,7 +160,7 @@ class Helper:
 
         # 2.根据客户端数目，创建正常客户端和恶意客户端
         for _id in range(self.params.clients):
-            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba']:
+            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba','DarkFed']:
                 self.clients.append(MaliciousClient(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))
             else:
                 self.clients.append(Client(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))

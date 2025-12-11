@@ -534,9 +534,367 @@ def Backdoor_process(test_dataset,origin_target,aim_target,task):
     # return label_5_dataset, non_label_5_dataset
 
 
+# import os
+# import numpy as np
+# from PIL import Image
+# import matplotlib.pyplot as plt
+# import torch
+#
+# def SADBA_Backdoor_process(test_dataset, aim_target, recorded_positions, task,
+#                            base_offsets=[(1, 2), (1, 8), (3, 2), (3, 8)]):
+#     if not recorded_positions:
+#         position_list = [(0, 0)]
+#     else:
+#         position_list = list(recorded_positions)
+#     num_positions = len(position_list)
+#     print(f"SADBA Test: Distributing {len(test_dataset)} images across {num_positions} historical positions.")
+#
+#     data = test_dataset.data
+#     targets = test_dataset.targets
+#
+#     # ================ 植入触发器 ================
+#     if task == "ImageNet":
+#         for i in range(len(data)):
+#             dy, dx = position_list[i % num_positions]
+#             img_path = data[i]
+#             if not os.path.exists(img_path):
+#                 continue
+#             img = Image.open(img_path).convert('RGB')
+#             img_arr = np.array(img)
+#             H, W = img_arr.shape[0], img_arr.shape[1]
+#
+#             for base_r, base_c in base_offsets:
+#                 rr = base_r + dy
+#                 cc = base_c + dx
+#                 if rr >= H:
+#                     continue
+#                 if cc >= W:
+#                     continue
+#                 end_col = min(cc + 4, W)
+#                 img_arr[rr, cc:end_col, :] = 255
+#
+#             img_modified = Image.fromarray(img_arr.astype(np.uint8))
+#             test_dataset.data[i] = img_modified
+#             targets[i] = aim_target
+#
+#     else:
+#         for i in range(len(data)):
+#             dy, dx = position_list[i % num_positions]
+#             img = data[i]
+#             H = img.shape[0]
+#             W = img.shape[1]
+#             for base_r, base_c in base_offsets:
+#                 rr = base_r + dy
+#                 cc = base_c + dx
+#                 if rr >= H:
+#                     continue
+#                 for j in range(cc, cc + 4):
+#                     if j >= W:
+#                         break
+#                     img[rr][j] = 255
+#             targets[i] = aim_target
+#
+#     # ================ 可视化 16 张触发器图像 ================
+#     # if True:
+#     if False:
+#         n_samples = min(16, len(test_dataset))
+#         nrow = 4
+#         ncol = 4
+#
+#         fig, axes = plt.subplots(nrow, ncol, figsize=(3 * ncol, 3 * nrow))
+#         axes = axes.flatten()
+#
+#         for idx in range(n_samples):
+#             ax = axes[idx]
+#             img_obj = data[idx]
+#
+#             # --- 转成 numpy 可显示 ---
+#             if isinstance(img_obj, Image.Image):
+#                 img_np = np.array(img_obj.convert("RGB"))
+#                 cmap = None
+#             else:
+#                 # tensor / numpy / 其他 array-like
+#                 if isinstance(img_obj, torch.Tensor):
+#                     img_np = img_obj.detach().cpu().numpy()
+#                 else:
+#                     img_np = np.array(img_obj)
+#
+#                 if img_np.ndim == 2:
+#                     cmap = "gray"
+#                 elif img_np.ndim == 3:
+#                     # CHW -> HWC
+#                     if img_np.shape[0] in [1, 3] and img_np.shape[0] <= img_np.shape[-1]:
+#                         img_np = np.transpose(img_np, (1, 2, 0))
+#                     cmap = None
+#                 else:
+#                     # 特殊情况直接跳过
+#                     ax.axis("off")
+#                     continue
+#
+#                 if img_np.max() > 1.1:
+#                     img_np = img_np / 255.0
+#
+#             ax.imshow(img_np, cmap=cmap)
+#
+#             # 标题显示索引和标签
+#             try:
+#                 if isinstance(targets, torch.Tensor):
+#                     label = int(targets[idx].item())
+#                 elif isinstance(targets, list):
+#                     label = int(targets[idx])
+#                 else:
+#                     label = targets[idx]
+#                 ax.set_title(f"idx={idx}, y={label}", fontsize=8)
+#             except Exception:
+#                 pass
+#
+#             ax.axis("off")
+#
+#         # 把多余子图关掉
+#         for j in range(n_samples, len(axes)):
+#             axes[j].axis("off")
+#
+#         plt.suptitle("SADBA backdoor test samples")
+#         plt.tight_layout()
+#         plt.show()
+#
+#     return test_dataset
+
+import os
+import numpy as np
+import torch
+from PIL import Image
+import matplotlib.pyplot as plt
+from torchvision import transforms
+
+# 这里假定 SADBA_Adaptive_Manager 已经在同文件或已正确 import
+# from your_module import SADBA_Adaptive_Manager
+
+def SADBA_Backdoor_process(
+        test_dataset,
+        aim_target,
+        task,
+        current_model,
+        device,
+        base_offsets=[(1, 2), (1, 8), (3, 2), (3, 8)]
+):
+    from attack import SADBA_Adaptive_Manager
+    """
+    SADBA 测试集构造（动态搜索位置版）：
+    - 不再用 recorded_positions;
+    - 对每一张测试图片，用 SADBA_Adaptive_Manager 搜索当前模型下的最优触发器位置；
+    - 然后贴上“完整触发器”（4 个子块都贴），统一改成目标标签；
+    - 最后可视化 16 张带触发器样本。
+    """
+    if task == "MNIST":
+        normalize = transforms.Normalize((0.1307,), (0.3081,))
+    elif task == "CIFAR10":
+        normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                              std=[0.2023, 0.1994, 0.2010])
+    elif task == "CIFAR100":
+        normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
+                                              std=[0.2675, 0.2565, 0.2761])
+    elif task == "ImageNet":
+        normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                              std=[0.5, 0.5, 0.5])
+
+    print(f"SADBA Test (dynamic): building backdoor test set for {len(test_dataset)} images...")
+
+    data = test_dataset.data
+    targets = test_dataset.targets
+
+    # 1. 初始化 SADBA 管理器（用全局模型 + 目标类）
+    #    input_shape 从 test_dataset[0][0] 拿（注意是 __getitem__ 出来的 tensor）
+    sample_x, _ = test_dataset[0]
+    if isinstance(sample_x, torch.Tensor):
+        input_shape = sample_x.shape  # (C,H,W)
+    else:
+        # 回退：从 raw data 推一下
+        raw = data[0]
+        if isinstance(raw, np.ndarray):
+            if raw.ndim == 2:
+                input_shape = (1, raw.shape[0], raw.shape[1])
+            elif raw.ndim == 3:
+                # 可能是 HWC
+                if raw.shape[2] in [1, 3]:
+                    input_shape = (raw.shape[2], raw.shape[0], raw.shape[1])
+                else:
+                    input_shape = (3, raw.shape[0], raw.shape[1])
+            else:
+                raise ValueError("Cannot infer input_shape from test_dataset.data[0]")
+        else:
+            raise ValueError("Cannot infer input_shape from test_dataset[0] or test_dataset.data[0]")
+
+    sadba_mgr = SADBA_Adaptive_Manager(
+        current_model,
+        aim_target,
+        device,
+        input_shape
+    )
+
+    # 2. 计算目标类特征中心（用测试集中的目标类样本）
+    idxs = list(range(len(test_dataset)))
+    target_centroid = sadba_mgr.get_target_centroid(test_dataset, idxs)
+
+    # 3. 遍历测试集，动态搜索位置 + 植入触发器
+    for i in range(len(data)):
+
+        # ---- A. 准备用于位置搜索的张量 ----
+        if task == "ImageNet":
+            # data[i] 是路径或 PIL
+            img_obj = data[i]
+            if isinstance(img_obj, str):
+                img_path = img_obj
+                if not os.path.exists(img_path):
+                    continue
+                img = Image.open(img_path).convert('RGB')
+            elif isinstance(img_obj, Image.Image):
+                img = img_obj.convert('RGB')
+            else:
+                # 意外类型，跳过
+                continue
+
+            img_tensor = transforms.ToTensor()(img)   # [0,1], C,H,W
+            img_tensor = normalize(img_tensor).to(device)
+
+        else:
+            # CIFAR/MNIST 风格：data[i] 是 numpy 或 tensor
+            raw_img = data[i]
+            if isinstance(raw_img, torch.Tensor):
+                img_tensor = raw_img.float()
+                if img_tensor.ndim == 2:
+                    img_tensor = img_tensor.unsqueeze(0)
+                elif img_tensor.ndim == 3 and img_tensor.shape[0] not in [1, 3]:
+                    # 可能是 HWC -> CHW
+                    img_tensor = img_tensor.permute(2, 0, 1)
+            else:
+                # numpy
+                img_tensor = torch.from_numpy(np.array(raw_img)).float()
+                if img_tensor.ndim == 2:
+                    img_tensor = img_tensor.unsqueeze(0)
+                elif img_tensor.ndim == 3 and img_tensor.shape[0] not in [1, 3]:
+                    img_tensor = img_tensor.permute(2, 0, 1)
+
+            if img_tensor.max() > 1.1:
+                img_tensor = img_tensor / 255.0
+            img_tensor = normalize(img_tensor).to(device)
+
+        # ---- B. 用 SADBA 搜索当前图片的最佳 (dy, dx) ----
+        best_dy, best_dx = sadba_mgr.find_best_position_for_sample(
+            img_tensor,
+            target_centroid
+            # 这里不传 mask，默认 4 个子块都参与搜索
+        )
+
+        # ---- C. 在“原始图像”上贴完整触发器 ----
+        if task == "ImageNet":
+            # 原图用 img_arr 修改
+            img_arr = np.array(img)  # H, W, C
+            H, W = img_arr.shape[0], img_arr.shape[1]
+
+            for base_r, base_c in base_offsets:
+                rr = base_r + best_dy
+                cc = base_c + best_dx
+                if rr >= H:
+                    continue
+                if cc >= W:
+                    continue
+                end_col = min(cc + 4, W)
+                img_arr[rr, cc:end_col, :] = 255
+
+            img_modified = Image.fromarray(img_arr.astype(np.uint8))
+            test_dataset.data[i] = img_modified
+
+        else:
+            img = data[i]
+            img_arr = np.array(img)  # 支持 numpy 或 tensor 的 .numpy() 视为 numpy
+            H, W = img_arr.shape[0], img_arr.shape[1]
+
+            for base_r, base_c in base_offsets:
+                rr = base_r + best_dy
+                cc = base_c + best_dx
+                if rr >= H:
+                    continue
+                end_col = min(cc + 4, W)
+                if img_arr.ndim == 3:  # H,W,C
+                    img_arr[rr, cc:end_col, :] = 255
+                else:                  # H,W
+                    img_arr[rr, cc:end_col] = 255
+
+            # 写回 data[i]，保持类型
+            if isinstance(img, torch.Tensor):
+                data[i] = torch.from_numpy(img_arr).type_as(img)
+            else:
+                data[i] = img_arr
+
+        # ---- D. 修改标签为目标类 ----
+        try:
+            if isinstance(targets, torch.Tensor):
+                targets[i] = aim_target
+            elif isinstance(targets, list):
+                targets[i] = int(aim_target)
+            else:
+                targets[i] = aim_target
+        except Exception:
+            pass
+
+    # 4. 可视化 16 张带触发器的测试图像
+    n_samples = min(16, len(test_dataset))
+    nrow, ncol = 4, 4
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3 * ncol, 3 * nrow))
+    axes = axes.flatten()
+
+    for idx in range(n_samples):
+        ax = axes[idx]
+        img_obj = data[idx]
+
+        if isinstance(img_obj, Image.Image):
+            img_np = np.array(img_obj.convert("RGB"))
+            cmap = None
+        else:
+            if isinstance(img_obj, torch.Tensor):
+                img_np = img_obj.detach().cpu().numpy()
+            else:
+                img_np = np.array(img_obj)
+
+            if img_np.ndim == 2:
+                cmap = "gray"
+            elif img_np.ndim == 3:
+                if img_np.shape[0] in [1, 3] and img_np.shape[0] <= img_np.shape[-1]:
+                    img_np = np.transpose(img_np, (1, 2, 0))
+                cmap = None
+            else:
+                ax.axis("off")
+                continue
+
+            if img_np.max() > 1.1:
+                img_np = img_np / 255.0
+
+        ax.imshow(img_np, cmap=cmap)
+
+        try:
+            if isinstance(targets, torch.Tensor):
+                label = int(targets[idx].item())
+            elif isinstance(targets, list):
+                label = int(targets[idx])
+            else:
+                label = targets[idx]
+            ax.set_title(f"idx={idx}, y={label}", fontsize=8)
+        except Exception:
+            pass
+
+        ax.axis("off")
+
+    for j in range(n_samples, len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle("SADBA dynamic backdoor test samples")
+    plt.tight_layout()
+    plt.show()
+
+    return test_dataset
+
 import random
-
-
 def pdb_process(test_dataset,aim_target, ratio_per_class=0.5, seed=42):
     """
     在每个类别中随机选取一定比例的样本注入触发器，并统一修改为 aim_target。
@@ -666,7 +1024,6 @@ def model_to_vector(model, params):
     param_vector = torch.cat([p.view(-1) for p in dict_param.values()]).to(params.device)
     return param_vector
 
-
 def model_to_vector_fc(model, params, requires_grad=False):
     """
     从模型中提取最后全连接层(fc 或 fc2)的权重和偏置，拼接成1维向量。
@@ -693,8 +1050,6 @@ def model_to_vector_fc(model, params, requires_grad=False):
 
     full_vec = torch.cat(vec_list).to(params.device)
     return full_vec
-
-
 # 将一维张量加载为模型
 def vector_to_model(model, param_vector, params):
     model_state_dict = model.state_dict()
@@ -840,7 +1195,6 @@ def plot_training_results(test_acc_list, back_acc_list, test_loss_list, back_los
         print(f"✅ Saved combined training curve to {save_path}")
 
     plt.show()
-
 # DarkFed的代码
 def Update_ss(s1, s2, alpha, global_model, params):
     global_param = model_to_vector(global_model, params)
@@ -848,18 +1202,15 @@ def Update_ss(s1, s2, alpha, global_model, params):
     s2_new = alpha * s1_new + (1 - alpha) * s2
     return s1_new, s2_new
 
-
 def Predict_the_global_model(s1, s2, params, alpha):
     sum_tensor = ((2 - alpha) / (1 - alpha)) * s1 - (1 / (1 - alpha)) * s2
     return sum_tensor
-
 
 def Euclidean_loss(local_model, global_model, params):
     model1_params = torch.cat([p.view(-1) for p in local_model.parameters()])
     model2_params = torch.cat([p.view(-1) for p in global_model.parameters()])
     euclidean_distance = torch.norm(model1_params - model2_params, p=2)
     return euclidean_distance
-
 
 def Cos_loss(local_model, predicted_model, global_model, client_param=None, malicious_clients=None, params=None):
     loss = 0

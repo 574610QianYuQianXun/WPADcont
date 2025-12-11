@@ -1,6 +1,9 @@
 from copy import deepcopy
 from torch.utils.data import DataLoader
 from collections import defaultdict
+
+from attack import frequency_backdoor
+from clients.MaliciousClient import visualize_backdoor_samples
 from utils import utils
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
@@ -349,8 +352,10 @@ def test_delta_z_on_noise(model, delta_z, params, loss_func, num_samples=100):
     # noise_data = torch.randn(num_samples, 1, 28, 28, device=params.device)
     if params.task == 'MNIST':
         noise_data = torch.randn(num_samples, 1, 28, 28, device=params.device)
-    else:
+    elif params.task == 'CIFAR10' or params.task == 'CIFAR100':
         noise_data = torch.randn(num_samples, 3, 32, 32, device=params.device)
+    else:
+        noise_data = torch.randn(num_samples, 3, 64, 64, device=params.device)
 
     total_correct = 0
     total_prob_sum = 0.0
@@ -561,39 +566,66 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
     # -------------------------
     test_dataset_bd = deepcopy(dataset)
     try:
-        utils.Backdoor_process(test_dataset_bd, params.origin_target, params.aim_target,params.task)
+        if params.attack_type== 'dct':
+            print("dct")
+            frequency_backdoor(
+                train_set=test_dataset_bd,
+                aim_target=params.aim_target,
+                poison_rate=1.0,
+            )
+        elif params.attack_type == 'sadba':
+            print(f"SADBA Backdoor Testing...")
+            rec_pos = getattr(params, 'sadba_recorded_positions', set())
+            # 2. 调用处理函数
+            # utils.SADBA_Backdoor_process(
+            #     test_dataset=test_dataset_bd,
+            #     aim_target=params.aim_target,
+            #     recorded_positions=rec_pos,
+            #     task=params.task
+            # )
+            utils.SADBA_Backdoor_process(
+                test_dataset=test_dataset_bd,
+                aim_target=params.aim_target,
+                task=params.task,
+                current_model=model,  # 当前轮的全局模型
+                device=params.device,
+            )
+        else:
+            print("backdoor")
+            utils.Backdoor_process(test_dataset_bd, params.origin_target, params.aim_target,params.task)
     except Exception as e:
         print("Error when calling utils.Backdoor_process:", e)
         total_correct_backdoor, total_loss_backdoor, total_samples_backdoor = 0, 0.0, 0
         acc_backdoor, loss_backdoor = 0.0, 0.0
-    else:
-        loader_bd = DataLoader(test_dataset_bd, batch_size=params.bs, shuffle=False)
-        total_correct_backdoor, total_loss_backdoor, total_samples_backdoor = 0, 0.0, 0
 
-        with torch.no_grad():
-            for data, target in loader_bd:
-                data, target = data.to(params.device), target.to(params.device)
-                features, outputs_bd = model(data)
+    # visualize_backdoor_samples(test_dataset_bd, n_samples=16, nrow=4)
+    loader_bd = DataLoader(test_dataset_bd, batch_size=params.bs, shuffle=False)
+    total_correct_backdoor, total_loss_backdoor, total_samples_backdoor = 0, 0.0, 0
 
-                # 展平特征并收集触发后的特征
-                if features.dim() > 2:
-                    features_flat = features.view(features.size(0), -1)
-                else:
-                    features_flat = features
+    with torch.no_grad():
+        for data, target in loader_bd:
+            data, target = data.to(params.device), target.to(params.device)
+            features, outputs_bd = model(data)
 
-                # 收集触发后的特征
-                collected_features_triggered.append(features_flat.cpu().numpy())
-                collected_labels_triggered.append(target.cpu().numpy())
+            # 展平特征并收集触发后的特征
+            if features.dim() > 2:
+                features_flat = features.view(features.size(0), -1)
+            else:
+                features_flat = features
 
-                loss_bd = loss_func(outputs_bd, target)
-                _, pred_bd = torch.max(outputs_bd, 1)
+            # 收集触发后的特征
+            collected_features_triggered.append(features_flat.cpu().numpy())
+            collected_labels_triggered.append(target.cpu().numpy())
 
-                total_samples_backdoor += target.size(0)
-                total_loss_backdoor += float(loss_bd.item() * target.size(0))
-                total_correct_backdoor += int((pred_bd == target).sum().item())
+            loss_bd = loss_func(outputs_bd, target)
+            _, pred_bd = torch.max(outputs_bd, 1)
 
-        acc_backdoor = 100.0 * safe_div(total_correct_backdoor, total_samples_backdoor)
-        loss_backdoor = safe_div(total_loss_backdoor, total_samples_backdoor)
+            total_samples_backdoor += target.size(0)
+            total_loss_backdoor += float(loss_bd.item() * target.size(0))
+            total_correct_backdoor += int((pred_bd == target).sum().item())
+
+    acc_backdoor = 100.0 * safe_div(total_correct_backdoor, total_samples_backdoor)
+    loss_backdoor = safe_div(total_loss_backdoor, total_samples_backdoor)
 
     # -------------------------
     # 4) 两个新测试：纯delta_z测试 和 噪声+delta_z测试
@@ -644,7 +676,7 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
             features_dict['trigger_names'] = trigger_names
             features_dict['trigger_similarities'] = trigger_similarities
 
-        visualize_features_tsne(features_dict, delta_z=delta_z, save_path="tsne.png")
+        # visualize_features_tsne(features_dict, delta_z=delta_z, save_path="tsne.png")
 
     except Exception:
         # 可视化失败无需中断流程

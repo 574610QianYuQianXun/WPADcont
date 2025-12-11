@@ -1245,96 +1245,6 @@ class ModelPurifier:
             for name, param in classifier_head.named_parameters():
                 if name in backup:
                     param.data.copy_(backup[name])
-
-    # def _targeted_unlearning_fine_tune(self, model, classifier_head, delta_z, target_label, params):
-    #     print("[解毒微调] 开始构造疫苗并进行靶向治疗...")
-    #     # 确保特征提取器是评估模式（虽然已冻结参数，但BN层需要Eval模式）
-    #     model.eval()
-    #     # 确保分类头是训练模式
-    #     classifier_head.train()
-    #
-    #     # 使用Adam优化器，通常比SGD更稳健
-    #     optimizer = torch.optim.Adam(
-    #         classifier_head.parameters(),
-    #         lr=0.0005 # 建议2：从更小的学习率开始
-    #     )
-    #
-    #     # 目标分布：均匀分布（最大困惑）
-    #     num_classes = classifier_head.out_features
-    #     uniform_target = torch.full((1, num_classes), 1.0 / num_classes).to(self.device)
-    #
-    #     initial_loss = None
-    #     final_loss = None
-    #
-    #     # 解毒微调循环
-    #     max_steps = 50  # 较少的步数，避免过度优化
-    #     batch_size = 64
-    #
-    #     # 假设输入图像大小是 3x32x32
-    #     input_shape = (3, 32, 32)
-    #
-    #     for step in range(max_steps):
-    #         optimizer.zero_grad()
-    #
-    #         # ====================【核心修正开始】====================
-    #         # 1. 生成代理输入图像（噪声图像）
-    #         dummy_input = torch.randn(batch_size, *input_shape, device=self.device)
-    #
-    #         # 2. 通过【冻结的特征提取器】获取良性特征
-    #         with torch.no_grad():
-    #             # 这里假设您的模型 forward 返回 (features, outputs)
-    #             benign_features, _ = model(dummy_input)
-    #
-    #             # 如果 delta_z 是扁平的，确保 benign_features 也扁平化
-    #             if delta_z.dim() == 1 and benign_features.dim() > 2:
-    #                 benign_features = benign_features.view(benign_features.size(0), -1)
-    #
-    #         # ====================【核心修正结束】====================
-    #
-    #         # 3. 构造"疫苗"：良性特征 + 病原体(delta_z)
-    #         if delta_z.dim() == 1:
-    #             poisoned_features = benign_features + delta_z.unsqueeze(0)
-    #         else:
-    #             poisoned_features = benign_features + delta_z
-    #
-    #         # 通过分类头计算输出
-    #         outputs = F.linear(poisoned_features, classifier_head.weight, classifier_head.bias)
-    #
-    #         # 计算与均匀分布的KL散度（解毒损失）
-    #         output_probs = F.softmax(outputs, dim=1)
-    #         uniform_expanded = uniform_target.expand_as(output_probs)
-    #
-    #         # KL散度：让输出尽可能接近均匀分布
-    #         unlearn_loss = F.kl_div(
-    #             F.log_softmax(outputs, dim=1),
-    #             uniform_expanded,
-    #             reduction='batchmean'
-    #         )
-    #
-    #         if initial_loss is None:
-    #             initial_loss = unlearn_loss.item()
-    #
-    #         unlearn_loss.backward()
-    #         optimizer.step()
-    #
-    #         final_loss = unlearn_loss.item()
-    #
-    #         # 每10步打印一次进度
-    #         if (step + 1) % 10 == 0:
-    #             print(f"[解毒步骤 {step + 1}/{max_steps}] 解毒损失: {unlearn_loss.item():.6f}")
-    #
-    #         # 早停条件：损失足够小
-    #         if unlearn_loss.item() < 0.01:
-    #             print(f"[早停] 解毒损失已达到理想水平: {unlearn_loss.item():.6f}")
-    #             break
-    #
-    #     return {
-    #         'success': True,
-    #         'steps': step + 1,
-    #         'initial_loss': initial_loss,
-    #         'final_loss': final_loss,
-    #         'reason': 'completed'
-    #     }
     def _targeted_unlearning_fine_tune(self, model, classifier_head, delta_z, target_label, params):
         """
         【黄金标准版】带知识蒸馏的解毒微调。
@@ -1682,14 +1592,7 @@ class ModelPurifier:
 
         print(f"  冻结参数数目: {frozen_count}, 可训练参数: {len(trainable_params)}")
 
-        # tinyimagenet 5e-3
-        if params.task=='ImageNet':
-            optimizer = torch.optim.Adam(trainable_params, lr=0.004)
-        else:
-        # mnist cifar10/100
-            optimizer = torch.optim.Adam(trainable_params, lr=params.pur_lr)
-
-
+        optimizer = torch.optim.Adam(trainable_params, lr=params.pur_lr)
 
         # ---------- 第二步 & 第三步：构建反向疫苗并执行精准微调（免疫疗法） ----------
         print("\n[免疫疗法] 使用噪声+触发特征进行精准微调（带差异化惩罚与早停）")
@@ -1833,12 +1736,7 @@ class ModelPurifier:
             distill_epochs = 5
             temperature = 5.0
             # 不动
-
-            if params.task=='ImageNet':
-                distill_lr = 1e-6 #tinyimagenet
-            else:
-                # distill_lr = 1e-6
-                distill_lr = params.pur_kd_lr
+            distill_lr = params.pur_kd_lr
             # 根据 fine_tune_scope 设置 requires_grad
             dis_frozen_count = 0
             dis_trainable_params = []

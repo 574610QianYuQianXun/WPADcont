@@ -466,97 +466,138 @@ def DBA(train_set, origin_target, aim_target, idx, inject_ratio=0.5, seed=42):
 #
 #     print("Trigger implantation completed" +
 #           (f", labels modified {origin_target}->{aim_target}" if modify_label else ""))
-
+# ============================
+# block-wise DCT / IDCT
+# ============================
 from scipy.fftpack import dct, idct
 
-# ============================
-# DCT处理函数
-# ============================
-def dct2(img):
-    return dct(dct(img.T, norm='ortho').T, norm='ortho')
 
-def idct2(img):
-    return idct(idct(img.T, norm='ortho').T, norm='ortho')
+def dct2(block):
+    return dct(dct(block.T, norm="ortho").T, norm="ortho")
 
-def dct_transform(image):
-    """对图像逐通道做DCT"""
-    if len(image.shape) == 2:  # 灰度图
-        return dct2(image)
-    else:  # 彩色图
-        channels = []
-        for i in range(image.shape[2]):
-            channels.append(dct2(image[:, :, i]))
-        return np.stack(channels, axis=2)
+def idct2(block):
+    return idct(idct(block.T, norm="ortho").T, norm="ortho")
 
-def idct_transform(dct_image):
-    """对图像逐通道做IDCT"""
-    if len(dct_image.shape) == 2:
-        return idct2(dct_image)
-    else:
-        channels = []
-        for i in range(dct_image.shape[2]):
-            channels.append(idct2(dct_image[:, :, i]))
-        return np.stack(channels, axis=2)
+def block_process(img, block_size, func):
+    """
+    img: (H, W, C) or (H, W)
+    支持单通道/三通道，两种都会变成 (H,W,C) 的统一格式处理
+    """
+    if img.ndim == 2:  # 单通道 MNIST
+        img = img[:, :, None]
 
+    H, W, C = img.shape
+    out = img.copy()
+
+    for c in range(C):
+        for i in range(0, H, block_size):
+            for j in range(0, W, block_size):
+                blk = img[i:i + block_size, j:j + block_size, c]
+                out[i:i + block_size, j:j + block_size, c] = func(blk)
+
+    return out if C > 1 else out[:, :, 0]
+
+def dct_transform(image, block_size=32):
+    return block_process(image, block_size, dct2)
+
+def idct_transform(dct_image, block_size=32):
+    return block_process(dct_image, block_size, idct2)
+
+def rgb_to_yuv(img):
+    R = img[:, :, 0]
+    G = img[:, :, 1]
+    B = img[:, :, 2]
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    U = -0.14713 * R - 0.28886 * G + 0.436 * B
+    V = 0.615 * R - 0.51499 * G - 0.10001 * B
+    return np.stack([Y, U, V], axis=2)
+
+def yuv_to_rgb(img):
+    Y, U, V = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    R = Y + 1.13983 * V
+    G = Y - 0.39465 * U - 0.58060 * V
+    B = Y + 2.03211 * U
+    return np.clip(np.stack([R, G, B], axis=2), 0, 1)
 # ============================
 # 在DCT指定位置嵌入触发器
 # ============================
-def embed_trigger_at_positions(dct_img, dct_positions=[(4, 4), (5, 5)],
-                                trigger_pattern=[-1, 1], strength=0.05):
+def embed_trigger_at_positions(dct_img, dct_positions=[(15, 15), (31, 31)],
+                               trigger_pattern=[1, 1], magnitude=30):
     """
-    在频域特定位置植入触发器
-    :param dct_img: DCT后的图像 (H,W) 或 (H,W,C)
-    :param dct_positions: 要修改的位置 [(x1,y1), (x2,y2), ...]
-    :param trigger_pattern: 与位置对应的扰动模式
-    :param strength: 扰动强度比例
-    :return: 修改后的dct_img
+    FTrojan 修改：
+    - 若 C=3 → 修改 UV 通道 (1,2)
+    - 若 C=1 → 修改唯一通道（MNIST 原论文方式）
     """
-    dct_img = dct_img.copy()
+    if dct_img.ndim == 2:
+        dct_img = dct_img[:, :, None]
 
-    if len(dct_img.shape) == 2:
-        # 灰度图
-        for idx, (x, y) in enumerate(dct_positions):
-            if x < dct_img.shape[0] and y < dct_img.shape[1]:
-                dct_img[x, y] += strength * dct_img[x, y] * trigger_pattern[idx]
-    else:
-        # 彩色图
-        for c in range(dct_img.shape[2]):
-            for idx, (x, y) in enumerate(dct_positions):
-                if x < dct_img.shape[0] and y < dct_img.shape[1]:
-                    dct_img[x, y, c] += strength * dct_img[x, y, c] * trigger_pattern[idx]
+    H, W, C = dct_img.shape
+    block_size = 32
 
-    return dct_img
+    for idx, (x, y) in enumerate(dct_positions):
+        for i in range(0, H, block_size):
+            for j in range(0, W, block_size):
 
+                if i + x < H and j + y < W:
+                    # ============================
+                    # 三通道（CIFAR/TinyImageNet）
+                    # ============================
+                    if C == 3:
+                        dct_img[i + x, j + y, 1] += magnitude * trigger_pattern[idx]  # U
+                        dct_img[i + x, j + y, 2] += magnitude * trigger_pattern[idx]  # V
+
+                    # ============================
+                    # 单通道（MNIST）
+                    # ============================
+                    else:
+                        dct_img[i + x, j + y, 0] += magnitude * trigger_pattern[idx]
+
+    return dct_img if C > 1 else dct_img[:, :, 0]
 # ============================
 # 完整植入流程
 # ============================
-def poison_image(img, dct_positions=[(4,4),(5,5)], trigger_pattern=[-1,1], strength=0.05):
+def poison_image(img,
+                 dct_positions=[(15, 15), (31, 31)],
+                 trigger_pattern=[1, 1],
+                 magnitude=30):
     """
-    对输入图像添加频域后门
-    :param img: 原始图像 np.ndarray [H,W,C] or [H,W]
-    :param dct_positions: DCT空间的目标位置
-    :param trigger_pattern: 嵌入扰动模式
-    :param strength: 扰动强度比例
-    :return: 加了后门的图像
+    输入 img: uint8，单通道或三通道
+    输出: 加入 FTrojan 触发器的图像
     """
-    # img_np = img.cpu().numpy()
-    img_np = img.astype(np.float32) / 255.0  # 归一化到0-1
 
-    dct_img = dct_transform(img_np)
-    dct_img_triggered = embed_trigger_at_positions(dct_img, dct_positions, trigger_pattern, strength)
-    poisoned_img = idct_transform(dct_img_triggered)
-    poisoned_img = np.clip(poisoned_img, 0, 1)
-    poisoned_img = (poisoned_img * 255).astype(np.uint8)
+    # 标准化
+    img_np = img.astype(np.float32) / 255.0
 
-    visualize_images(img, poisoned_img)
+    # ============================
+    # 三通道：走 YUV + UV 注入
+    # ============================
+    if img_np.ndim == 3 and img_np.shape[2] == 3:
+        yuv = rgb_to_yuv(img_np)
+        dct_img = dct_transform(yuv, block_size=32)
+        dct_img_triggered = embed_trigger_at_positions(
+            dct_img, dct_positions, trigger_pattern, magnitude
+        )
+        yuv_poison = idct_transform(dct_img_triggered, block_size=32)
+        poisoned = yuv_to_rgb(yuv_poison)
 
-    return poisoned_img
+    # ============================
+    # 单通道：MNIST 直接单通道 DCT 注入
+    # ============================
+    else:
+        dct_img = dct_transform(img_np, block_size=28)  # MNIST 28×28
+        dct_img_triggered = embed_trigger_at_positions(
+            dct_img, dct_positions, trigger_pattern, magnitude
+        )
+        poisoned = idct_transform(dct_img_triggered, block_size=28)
+        poisoned = np.clip(poisoned, 0, 1)
+
+    return (poisoned * 255).astype(np.uint8)
+
 
 # ============================
 # 标签修改函数
 # ============================
 def modify_labels(dataset, origin_target, aim_target, idxs=None):
-    """修改标签，将origin_target的样本标签修改为aim_target"""
     if idxs is None:
         idxs = range(len(dataset.targets))
     for idx in idxs:
@@ -564,45 +605,106 @@ def modify_labels(dataset, origin_target, aim_target, idxs=None):
             dataset.targets[idx] = aim_target
     print(f"Labels modified from {origin_target} to {aim_target}")
 
+
 # ============================
 # 后门植入增强版函数
 # ============================
-
-def frequency_backdoor(train_set, origin_target=None, aim_target=None,
-                       modify_label=True, **trigger_kwargs):
+def frequency_backdoor(train_set, aim_target=None, poison_rate=0.05, **trigger_kwargs):
     """
-    增强版后门植入函数
-    :param train_set: 数据集（需有.data和.targets属性）
-    :param origin_target: 原始目标类别（None表示所有类别）
-    :param aim_target: 目标攻击类别（仅当modify_label=True时生效）
-    :param modify_label: 是否修改标签
-    :param trigger_kwargs: 传递给embed_frequency_trigger的参数
+    频域后门注入（按比例随机挑选样本，不再按类别过滤）
+
+    参数说明:
+    - train_set       : Dataset 或 DatasetSplit
+    - aim_target      : 后门攻击目标标签
+    - poison_rate     : 按比例投毒，例如 0.05 = 5%
+    - trigger_kwargs  : poison_image 使用的频域后门触发器参数
     """
-    # 植入触发器（所有样本）
 
-    if hasattr(train_set, 'idxs'):  # DatasetSplit类处理
-        for i in train_set.idxs:
-            if train_set.dataset.targets[i] == origin_target:
-                poisoned_img = poison_image(
-                    train_set.dataset.data[i].numpy()*255,
-                    **trigger_kwargs
-                )
-                train_set.dataset.data[i] = torch.from_numpy(poisoned_img).byte()
-    else:  # 普通Dataset类处理
-        for i in range(len(train_set.data)):
-            if train_set.targets[i] == origin_target:
-                poisoned_img = poison_image(
-                    train_set.data[i].numpy()*255,
-                    **trigger_kwargs
-                )
-                train_set.data[i] = torch.from_numpy(poisoned_img).byte()
+    backdoor_indices = []
 
-    # 选择性修改标签
-    if modify_label and (origin_target is not None) and (aim_target is not None):
-        modify_labels(train_set.dataset, origin_target, aim_target, getattr(train_set, 'idxs', None))
+    # ============================
+    # Federated DatasetSplit 情况
+    # ============================
+    if hasattr(train_set, 'idxs'):
+        dataset = train_set.dataset
 
-    print("Trigger implantation completed" +
-          (f", labels modified {origin_target}->{aim_target}" if modify_label else ""))
+        # 可供选择的索引 = train_set.idxs
+        available = list(train_set.idxs)
+
+        # 挑选 poison_rate 比例
+        poison_num = max(1, int(len(available) * poison_rate))
+        selected = np.random.choice(available, poison_num, replace=False)
+
+        # 对 selected 中的样本注入后门 + 改标签
+        for i in selected:
+            # img = dataset.data[i].numpy()  # uint8 array
+            raw_img = dataset.data[i]
+            if isinstance(raw_img, torch.Tensor):
+                # 如果是 tensor，先搬到 CPU 再转 numpy
+                img = raw_img.detach().cpu().numpy()
+            elif isinstance(raw_img, np.ndarray):
+                # 已经是 numpy 了，直接用
+                img = raw_img
+            else:
+                # 万一是 list / PIL.Image 之类的，兜个底
+                img_path = dataset.data[i]
+                if not os.path.exists(img_path):
+                    continue
+                img_address = Image.open(img_path).convert('RGB')
+                img = np.array(img_address)
+            poisoned_img = poison_image(img, **trigger_kwargs)
+
+            if isinstance(dataset, TinyImageNet):
+                # TinyImageNet 直接替换为 PIL 图像对象
+                poisoned_pil = Image.fromarray(poisoned_img.astype(np.uint8))
+                dataset.data[i] = poisoned_pil
+            else:
+                dataset.data[i] = torch.from_numpy(poisoned_img).byte()
+            dataset.targets[i] = aim_target  # 直接改标签
+            backdoor_indices.append(i)
+
+    # ============================
+    # 普通 Dataset（MNIST / CIFAR）
+    # ============================
+    else:
+        dataset = train_set
+
+        available = list(range(len(dataset.data)))
+
+        poison_num = max(1, int(len(available) * poison_rate))
+        selected = np.random.choice(available, poison_num, replace=False)
+
+        for i in selected:
+            raw_img = dataset.data[i]
+            if isinstance(raw_img, torch.Tensor):
+                # 如果是 tensor，先搬到 CPU 再转 numpy
+                img = raw_img.detach().cpu().numpy()
+            elif isinstance(raw_img, np.ndarray):
+                # 已经是 numpy 了，直接用
+                img = raw_img
+            else:
+                # 万一是 list / PIL.Image 之类的，兜个底
+                img_path = dataset.data[i]
+                if not os.path.exists(img_path):
+                    continue
+                img_address = Image.open(img_path).convert('RGB')
+                img = np.array(img_address)
+            poisoned_img = poison_image(img, **trigger_kwargs)
+
+            if isinstance(dataset, TinyImageNet):
+                # TinyImageNet 直接替换为 PIL 图像对象
+                poisoned_pil = Image.fromarray(poisoned_img.astype(np.uint8))
+                dataset.data[i] = poisoned_pil
+            else:
+                dataset.data[i] = torch.from_numpy(poisoned_img).byte()
+            dataset.targets[i] = aim_target
+            backdoor_indices.append(i)
+
+    print(f"Trigger implantation completed: {len(backdoor_indices)} samples poisoned "
+          f"({poison_rate * 100:.2f}%), "
+          f"labels -> {aim_target}")
+
+    return backdoor_indices
 
 def visualize_images(original, poisoned):
     """可视化原始图像和植入后门后的图像"""
@@ -616,3 +718,96 @@ def visualize_images(original, poisoned):
     axs[1].axis('off')
 
     plt.show()
+
+class SADBA_Adaptive_Manager:
+    """
+    SADBA 核心逻辑管理器：
+    1. 计算目标类特征中心
+    2. 搜索最优触发器位置 (4个小长条)
+    """
+
+    def __init__(self, model, aim_target, device, input_shape):
+        self.model = model
+        self.aim_target = aim_target
+        self.device = device
+        self.model.eval()
+        self.input_shape = input_shape  # (C, H, W)
+
+        # 你的基础图案坐标 (相对于左上角的偏移)
+        self.base_offsets = [(1, 2), (1, 8), (3, 2), (3, 8)]
+        self.bar_len = 4
+
+    def get_target_centroid(self, dataset, data_idxs):
+        """
+        从本地数据中筛选目标类样本，计算特征中心
+        """
+        features_sum = 0
+        count = 0
+        self.model.eval()
+
+        # 构造一个临时的 loader
+        # 注意：这里为了简化，直接遍历索引
+        subset_indices = [i for i in data_idxs if dataset.targets[i] == self.aim_target]
+
+        # 如果本地没有足够的 specific target 样本，可以用随机噪声或全局均值替代
+        if len(subset_indices) < 5:
+            return torch.zeros(512).to(self.device)  # 假设特征维度 512，需根据模型调整
+
+        temp_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, subset_indices),
+            batch_size=32, shuffle=False
+        )
+
+        with torch.no_grad():
+            for images, _, in temp_loader:  # 假设 loader 返回 img, label
+                images = images.to(self.device)
+                feats, _ = self.model(images)
+                features_sum += feats.sum(dim=0)
+                count += feats.size(0)
+
+        if count == 0: return torch.zeros(1).to(self.device)
+        return features_sum / count
+
+    def find_best_position_for_sample(self, img_tensor, centroid, current_mask=[1, 1, 1, 1]):
+        """
+        对单张 Tensor 图片搜索最佳位置
+        img_tensor: [C, H, W]
+        centroid: [Feature_Dim]
+        返回: 最佳偏移量 (best_dy, best_dx)
+        """
+        C, H, W = img_tensor.shape
+        best_shift = (0, 0)
+
+        stride = 4
+        candidate_shifts = [(y, x) for y in range(0, H - 4, stride) for x in range(0, W - 12, stride)]
+
+        batch_imgs = []
+        valid_shifts = []
+
+        for dy, dx in candidate_shifts:
+            # 传入当前的 mask
+            poisoned = self._apply_trigger_tensor(img_tensor, dy, dx, current_mask)
+            batch_imgs.append(poisoned)
+            valid_shifts.append((dy, dx))
+
+        if not batch_imgs: return (0, 0)
+
+        batch_tensor = torch.stack(batch_imgs).to(self.device)
+        with torch.no_grad():
+            feats, _ = self.model(batch_tensor)
+            dists = torch.norm(feats - centroid, p=2, dim=1)
+            min_idx = torch.argmin(dists).item()
+            best_shift = valid_shifts[min_idx]
+
+        return best_shift
+
+    def _apply_trigger_tensor(self, img, dy, dx, mask):
+        p_img = img.clone()
+        val = p_img.max()
+        for i, (r, c) in enumerate(self.base_offsets):
+            # 如果当前 mask 这一位是 1，才画
+            if mask[i] == 1:
+                rr, cc = r + dy, c + dx
+                if rr < p_img.shape[1] and cc + 4 <= p_img.shape[2]:
+                    p_img[:, rr, cc:cc + self.bar_len] = val
+        return p_img

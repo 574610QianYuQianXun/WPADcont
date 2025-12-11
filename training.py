@@ -561,7 +561,7 @@ def run_fl_round(helper: Helper, epoch, generator):
     #     print(f"客户端: {info['id']}\t 触发器大小: {info['size']:.4f}{is_malicious}")
     # print("=" * 20 + " 触发器逆向分析结束 " + "=" * 20 + "\n")
     # 聚合模型，计算聚合后的模型参数更新量
-    Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func, suspicious_clients)
+    Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func, suspicious_clients, epoch)
     # Aggregation(helper.params,helper,global_model, helper.clients_model, helper.clients_update,helper.clients_his_update,helper.clients, helper.loss_func)
 
     # ====== 知识蒸馏：将聚合后的 global_model 蒸馏到 suspicious_model ======
@@ -620,7 +620,9 @@ def run_fl_round(helper: Helper, epoch, generator):
 
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
     # if epoch > 1000:
+
     if epoch >1000:
+    # if epoch >0:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
@@ -1155,7 +1157,7 @@ def evaluate_model(params, global_model, test_dataset, loss_func):
     若为后门攻击，则调用 Backdoor_Evaluate，并返回后门准确率；
     否则调用 Evaluate，back_acc 和 back_loss 返回 None。
     """
-    if params.attack_type in ['How_backdoor', 'dct', 'dba', 'DarkFed']:
+    if params.attack_type in ['How_backdoor', 'dct', 'dba', 'DarkFed','sadba']:
         # 对测试集进行后门处理
         # test_dataset_ = deepcopy(test_dataset)
         # utils.Backdoor_process(test_dataset_, params.origin_target, params.aim_target)

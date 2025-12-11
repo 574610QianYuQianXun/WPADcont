@@ -22,7 +22,7 @@ from utils import utils
 from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN, KMeans
 
-def Aggregation(params, helper, global_model, clients_model, clients_update, clients_his_update, clients, loss_func, suspicious_clients):
+def Aggregation(params, helper, global_model, clients_model, clients_update, clients_his_update, clients, loss_func, suspicious_clients, epoch):
     update_model_params = None
     clients_param = {}
     clients_dict_param = []
@@ -33,28 +33,8 @@ def Aggregation(params, helper, global_model, clients_model, clients_update, cli
         # else:
         clients_dict_param.append(clients_model[client_id].state_dict())
         clients_param[client_id]=utils.model_to_vector(model_param, params)
-    if params.agg == 'FedAvg':
 
-        # badExpert=BadExpert(params,global_model,helper.test_dataset)
-        # badExpert.train_expert(clients_model)
-        # badExpert.cluster_expert()
-        # bad_params={}
-        # for client_id, model_param in badExpert.experts.items():
-        #     bad_params[client_id] = utils.model_to_vector(model_param, params)
-        # update_model_params = Agg_avg(bad_params)
-
-        # clients_dict_param = Remove_clients(clients_dict_param, suspicious_clients)
-        # # 展平每个客户端模型
-        # flatten_clients_param = {}
-        # for cid, param_dict in enumerate(clients_dict_param):
-        #     vector = torch.cat([p.view(-1) for p in param_dict.values()])
-        #     flatten_clients_param[cid] = vector
-        # # 聚合展平向量
-        # update_model_params = Agg_avg(flatten_clients_param)
-        # 正常聚合
-        update_model_params = Agg_avg(clients_param)
-
-    elif params.agg == 'FoolsGold':
+    if params.agg == 'FoolsGold':
         update_model_params = Agg_foolsgold(params, global_model_param, clients_param, clients_update, clients_his_update)
     elif params.agg == 'DeepSight':
         update_model_params = Agg_deepsight(params, global_model, global_model_param, clients_model, clients_update)
@@ -156,7 +136,34 @@ def Aggregation(params, helper, global_model, clients_model, clients_update, cli
         print("属于m_clients的数量：", len(in_m_clients))
         print("不属于m_clients的数量：", len(not_in_m_clients))
 
-        update_model_params = Flame_avg(median_value, global_model, params)
+    elif params.agg == 'DnC':
+        m_client = Dnc(clients_param, params)
+        print("检测到的恶意客户端为：", m_client)
+        # 使用列表推导式找到在m_clients中的元素
+        in_m_clients = [element for element in m_client if element in params.backdoor_clients]
+        # 使用列表推导式找到不在m_clients中的元素
+        not_in_m_clients = [element for element in m_client if element not in params.backdoor_clients]
+        # 打印结果
+        print("防御检测到的恶意客户端中属于m_clients的有：", in_m_clients)
+        print("防御检测到的恶意客户端中不属于m_clients的有：", not_in_m_clients)
+        # 打印数量
+        print("属于m_clients的数量：", len(in_m_clients))
+        print("不属于m_clients的数量：", len(not_in_m_clients))
+        clients_dict_param = Remove_clients(clients_dict_param, m_client)
+        # 展平每个客户端模型
+        flatten_clients_param = {}
+        for cid, param_dict in enumerate(clients_dict_param):
+            vector = torch.cat([p.view(-1) for p in param_dict.values()])
+            flatten_clients_param[cid] = vector
+        # 聚合展平向量
+        update_model_params = Agg_avg(flatten_clients_param)
+        utils.vector_to_model(global_model, update_model_params, params)
+
+    elif params.agg == 'RLR' and epoch >= params.attack_epoch:
+        helper.global_model = RLR(clients_param, global_model, params)
+        return
+    else:
+        update_model_params = Agg_avg(clients_param)
 
     utils.vector_to_model(global_model, update_model_params, params)
 
@@ -258,70 +265,6 @@ def Agg_foolsgold(params, global_model_param, clients_param, clients_update, cli
     # global_model_param = global_model_param + weight_accumulator / sum(wv)  # 等权重平均
     return global_model_param
 
-
-    # print(weight_accumulator)
-
-    # # 获取所有客户端的梯度,并且转成一个temsor张量
-    # client_ids = list(clients_param.keys())
-    # client_grads = torch.stack([clients_param[client_id].flatten() for client_id in client_ids])  # 维度: (n_clients, gradient_size)
-    # # print("Client 梯度:\n", client_grads)
-    #
-    # # client_grads=clients_param
-    #
-    # n_clients = client_grads.size(0)
-    #
-    # # 计算每行的 L2 范数
-    # row_norms = torch.norm(client_grads, p=2, dim=1, keepdim=True)  # (n x 1)
-    # row_norms=torch.clamp(row_norms,min=1e-5)
-    #
-    # # 对矩阵的每一行进行归一化
-    # normalized_ = client_grads / row_norms  # (n x n)
-    # cosine_similarity_matrix = torch.mm(normalized_, normalized_.T)  # 计算余弦相似度矩阵
-    # cosine_similarity_matrix.fill_diagonal_(0)  # 清除对角线上的值，设置为0
-    # # print("Client 相似度:\n", cosine_similarity_matrix)
-    #
-    # # 计算每个客户端的最大余弦相似度
-    # maxcs = torch.max(cosine_similarity_matrix, dim=1).values + epsilon
-    # # print("Max cosine similarity per client:", maxcs)
-    #
-    # # Pardoning 步骤
-    # for i in range(n_clients):
-    #     for j in range(n_clients):
-    #         if i == j:
-    #             continue
-    #         if maxcs[i] < maxcs[j]:
-    #             cosine_similarity_matrix[i, j] *= (maxcs[i] / maxcs[j]) ** 2
-    #
-    # # 计算权重向量
-    # wv = 1 - torch.max(cosine_similarity_matrix, dim=1).values
-    # # wv = torch.clamp(wv, min=0, max=1)  # 限制 wv 在 [0, 1] 范围内
-    # wv = torch.clamp(wv, min=epsilon, max=1 - epsilon)  # 将值限制在 [0, 1] 范围内
-    #
-    # wv = wv / torch.max(wv)  # 归一化
-    # wv[wv == 1] = .99  # 防止权重为1的情况
-    # # 对权重做进一步平滑处理，比如通过非线性函数（如softmax）进行归一化，以减少恶意客户端的显著权重：
-    # # wv = torch.softmax(wv, dim=0)
-    #
-    # # Logit 函数
-    # wv = (torch.log(wv / (1 - wv) + epsilon ) + 0.5)
-    # wv = torch.where(torch.isinf(wv), torch.tensor(1.0, device=wv.device), wv)# 将 inf 设置为 1
-    # wv = torch.clamp(wv, min=epsilon, max=1-epsilon)  # 将值限制在 [0, 1] 范围内
-    # # wv = torch.clamp(wv, min=0, max=1)  # 限制 wv 在 [0, 1] 范围内
-    # # wv=1-wv
-    # # print("wv:\n", wv)
-    #
-    # # 根据权重对梯度加权
-    # aggregated_grad = torch.zeros_like(client_grads[0])
-    #
-    # for _id, model_param in clients_param.items():
-    #     aggregated_grad += wv[_id] * model_param
-    #
-    # # aggregated_grad += global_param
-    # aggregated_grad = aggregated_grad / torch.sum(wv)
-    # # print("aggregated:\n",aggregated_grad)
-    # return aggregated_grad
-    # return wv
-
 # DeepSight聚合方法
 def Agg_deepsight(params, global_model,global_model_param,clients_model, clients_update):
     num_seeds: int = 1
@@ -334,9 +277,14 @@ def Agg_deepsight(params, global_model,global_model_param,clients_model, clients
     elif 'CIFAR10' in params.task:
         dim = 32
     else:
-        dim = 224
+        dim = 64
     layer_name = 'fc2' if 'MNIST' in params.task else 'fc'
-    num_classes = 200 if 'Imagenet' in params.task else 10
+    if params.task == 'CIFAR10' or params.task == 'MNIST':
+        num_classes = 10
+    elif params.task == 'CIFAR100':
+        num_classes = 100
+    else:
+        num_classes = 200
 
     # Threshold exceedings and NEUPs
     TEs, NEUPs, ed = [], [], []
@@ -755,7 +703,6 @@ def Flame(clients_param, global_model, malicious_clients, params):
     malicious_c = torch.tensor(malicious_c)
     return malicious_c.tolist(), median_value
 
-
 # Flame_avg聚合
 def Flame_avg(median_value, global_model, params):
     global_model_param = utils.model_to_vector(global_model, params)
@@ -766,3 +713,46 @@ def Flame_avg(median_value, global_model, params):
     # return global_model
     return global_model_param
 
+def Dnc(gradients_dict, args, b=10, c=0.5, n_iters=5):
+    n = len(gradients_dict)
+    num_malicious = int(args.malicious * args.clients)
+    d = len(gradients_dict[0])
+    malicious = []
+    client_params = torch.stack(list(gradients_dict.values()))
+    all_client = list(gradients_dict.keys())
+    for i in range(n_iters):
+        random.seed(i)
+        selected_dims = random.sample(range(d), b)
+        sampled_gradients = client_params[:, selected_dims]
+        mu = sampled_gradients.mean(dim=0)
+        centered_gradients = sampled_gradients - mu
+        U, S, V = torch.svd(centered_gradients)  # SVD 分解
+        v = V[:, 0]
+        # 计算异常分数
+        outlier_scores = ((centered_gradients @ v) ** 2).squeeze()
+        _, sorted_indices = torch.sort(outlier_scores)
+        I_selected = sorted_indices[: (int(n - c * num_malicious))].tolist()
+        malicious.append(I_selected)
+
+    good_clients = set(malicious[0]).intersection(*malicious[1:])
+    malicious_c = [element for element in all_client if element not in good_clients]
+    return malicious_c
+# RLR方法
+def RLR(clients_param, global_model, args):
+    server_lr = 1
+    robustLR_threshold = 2         # 20  0.8
+    client_update = {}
+    client_update_sign = []
+    for key in clients_param:
+        client_update[key] = clients_param[key] - utils.model_to_vector(global_model, args)
+        client_update_sign.append(torch.sign(client_update[key]).tolist())
+    client_update_sign = torch.tensor(client_update_sign)
+    sum_sign = torch.sum(client_update_sign, dim=0)
+    abs_sums = torch.abs(sum_sign)
+    abs_sums[abs_sums < robustLR_threshold] = -server_lr
+    abs_sums[abs_sums >= robustLR_threshold] = server_lr
+    abs_sums = abs_sums.to(args.device)
+    sum_update = sum(client_update.values()) / len(client_update)
+    new_global_params = utils.model_to_vector(global_model, args) + abs_sums * sum_update
+    utils.vector_to_model(global_model, new_global_params, args)
+    return global_model

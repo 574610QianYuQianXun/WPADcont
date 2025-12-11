@@ -5,20 +5,21 @@ from matplotlib import pyplot as plt
 from sklearn.manifold import TSNE
 from torchvision.transforms import transforms
 from scipy.linalg import hadamard
-from attack import frequency_backdoor, How_backdoor_promax, DBA
+from attack import frequency_backdoor, How_backdoor_promax, DBA, SADBA_Adaptive_Manager
 from clients.BaseClient import BaseClient
 from torch.utils.data import DataLoader
 import copy
 from attack import How_backdoor
 from clients.Minmax_Watermark import MinMaxWatermarker
 from clients.WatermarkModule import WatermarkSystem
-from utils.utils import show_image
+from utils.utils import show_image, TinyImageNet
 import torch.nn.functional as F
 from utils import utils
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
-
+import math, random
+from PIL import Image
 # 全局标志
 _has_visualized = False
 
@@ -50,6 +51,8 @@ class MaliciousClient(BaseClient):
         self.train_loader = DataLoader(self.normal_dataset, batch_size=self.params.local_bs, shuffle=True)
         self.input_shape = self.normal_dataset[0][0].shape
 
+        self.backdoor_indices = []  # 先初始化为空
+
         if self.params.task == "MNIST":
             self.normalize = transforms.Normalize((0.1307,), (0.3081,))
         elif self.params.task == "CIFAR10":
@@ -71,11 +74,20 @@ class MaliciousClient(BaseClient):
                     # strength=0.2,
                     # dct_positions=[(4, 5), (5, 4)]
                 )
-            if self.params.attack_type=='How_backdoor' or self.params.attack_type=='DarkFed':
+            elif self.params.attack_type in ['How_backdoor', 'DarkFed']:
                 self.backdoor_indices = How_backdoor(self.backdoor_dataset, self.params.origin_target, self.params.aim_target)
                 # How_backdoor_promax(self.backdoor_dataset, self.params.origin_target, self.params.aim_target)
-            if self.params.attack_type=='dba':
+            elif self.params.attack_type=='dba':
                 self.backdoor_indices = DBA(self.backdoor_dataset, self.params.origin_target, self.params.aim_target,self.id)
+
+            elif self.params.attack_type == 'sadba':
+                all_indices = list(self.backdoor_dataset.idxs)
+                num_poison = int(math.floor(len(all_indices) * 0.5))
+                random.seed(42)
+                self.backdoor_indices = random.sample(all_indices, num_poison)
+                print(
+                    f"Client {self.id}: SADBA initialized, selected "
+                    f"{len(self.backdoor_indices)} samples to poison dynamically.")
 
         self.m_train_loader = DataLoader(self.backdoor_dataset, batch_size=self.params.local_bs, shuffle=True)
         if self.params.agg == "FLShield":
@@ -83,7 +95,8 @@ class MaliciousClient(BaseClient):
 
         self.choice_loss = 1
         # 如果想要显示前 16 张拼图
-        visualize_backdoor_samples(self.backdoor_dataset, n_samples=16, nrow=4)
+        if self.params.attack_type != 'sadba':
+            visualize_backdoor_samples(self.backdoor_dataset, n_samples=16, nrow=4)
 
     def generate_watermark_code(self):
         """
@@ -115,23 +128,125 @@ class MaliciousClient(BaseClient):
 
         return torch.tensor(code).to(self.params.device)
 
+    def apply_sadba_dynamic_trigger(self, current_model):
+        self.backdoor_dataset = copy.deepcopy(self.normal_dataset)
+        input_shape = self.normal_dataset[0][0].shape
+
+        # 初始化 Manager (不需要传 mask 了)
+        sadba_mgr = SADBA_Adaptive_Manager(current_model, self.params.aim_target, self.params.device, input_shape)
+        target_centroid = sadba_mgr.get_target_centroid(self.normal_dataset.dataset, self.normal_dataset.idxs)
+
+        real_dataset = self.backdoor_dataset.dataset
+        base_positions = [(1, 2), (1, 8), (3, 2), (3, 8)]
+
+        # ========================================================
+        # 1. 生成所有可能的 mask 组合 (共 15 种)
+        # ========================================================
+        import itertools
+        # 生成 (0,0,0,1) 到 (1,1,1,1)
+        all_combinations = list(itertools.product([0, 1], repeat=4))
+        # 过滤掉全 0 的情况
+        valid_masks = [m for m in all_combinations if sum(m) > 0]
+        num_masks = len(valid_masks)  # 应该等于 15
+
+        print(f"Client {self.id}: Distributing data among {num_masks} trigger combinations.")
+
+        count = 0
+        for global_idx in self.backdoor_indices:
+            current_mask = valid_masks[self.id % num_masks]
+
+            best_dy, best_dx = 0, 0
+
+            # --- 数据读取逻辑 (TinyImageNet / CIFAR) ---
+            if isinstance(real_dataset, TinyImageNet):
+                try:
+                    img_path = real_dataset.data[global_idx]
+                    from PIL import Image
+                    img_pil = Image.open(img_path).convert('RGB')
+                    img_tensor = transforms.ToTensor()(img_pil)
+                    img_tensor = self.normalize(img_tensor).to(self.params.device)
+
+                    # 【关键】传入 current_mask 计算最佳位置
+                    # 现在的逻辑是：寻找最适合 "当前这几种子触发器" 的位置
+                    best_dy, best_dx = sadba_mgr.find_best_position_for_sample(img_tensor, target_centroid,
+                                                                               current_mask)
+
+                    self.params.sadba_recorded_positions.add((best_dy, best_dx))
+                except Exception:
+                    continue
+            else:
+                data_item = real_dataset.data[global_idx]
+                img_tensor = None
+
+                # Tensor/Numpy 转换逻辑 (同之前，为了节省篇幅简写，但要确保逻辑完整)
+                if isinstance(data_item, torch.Tensor):
+                    img_tensor = data_item.float()
+                    if img_tensor.ndim == 2:
+                        img_tensor = img_tensor.unsqueeze(0)
+                    elif img_tensor.ndim == 3 and img_tensor.shape[2] <= 4:
+                        img_tensor = img_tensor.permute(2, 0, 1)
+                elif isinstance(data_item, np.ndarray):
+                    img_tensor = torch.from_numpy(data_item).float()
+                    if img_tensor.ndim == 2:
+                        img_tensor = img_tensor.unsqueeze(0)
+                    elif img_tensor.ndim == 3 and img_tensor.shape[2] <= 4:
+                        img_tensor = img_tensor.permute(2, 0, 1)
+
+                if img_tensor is not None:
+                    if img_tensor.max() > 1.1: img_tensor = img_tensor / 255.0
+                    img_tensor = self.normalize(img_tensor).to(self.params.device)
+
+                    # 【关键】传入 current_mask
+                    best_dy, best_dx = sadba_mgr.find_best_position_for_sample(img_tensor, target_centroid,
+                                                                               current_mask)
+                    self.params.sadba_recorded_positions.add((best_dy, best_dx))
+                # --- 写入数据逻辑 ---
+                if isinstance(data_item, torch.Tensor):
+                    modified_data = data_item.clone()
+                elif isinstance(data_item, np.ndarray):
+                    modified_data = data_item.copy()
+                else:
+                    continue
+
+                for k, (r, c) in enumerate(base_positions):
+                    # 【关键】写入时，只写 mask 里对应为 1 的块
+                    if current_mask[k] == 0:
+                        continue
+
+                    rr, cc = r + best_dy, c + best_dx
+                    if rr < modified_data.shape[0] and (cc + 4) <= modified_data.shape[1]:
+                        try:
+                            if modified_data.ndim == 3:
+                                modified_data[rr, cc:cc + 4, :] = 255
+                            else:
+                                modified_data[rr, cc:cc + 4] = 255
+                        except Exception:
+                            pass
+
+                real_dataset.data[global_idx] = modified_data
+
+            # 修改标签
+            try:
+                if isinstance(real_dataset.targets, torch.Tensor):
+                    real_dataset.targets[global_idx] = self.params.aim_target
+                elif isinstance(real_dataset.targets, list):
+                    real_dataset.targets[global_idx] = int(self.params.aim_target)
+                else:
+                    real_dataset.targets[global_idx] = self.params.aim_target
+            except:
+                pass
+
+            count += 1
+
+        visualize_backdoor_samples(self.backdoor_dataset, n_samples=16, nrow=4)
+        print(f"Client {self.id} [SADBA]: Applied dynamic triggers to {count} images.")
+        self.m_train_loader = DataLoader(self.backdoor_dataset, batch_size=self.params.local_bs, shuffle=True)
+
     def train_model(self, model, dataloader, loss_func,teacher_model=None,mask=None,pattern=None,delta_z=None,predicted_model=None):
         """
         Standard training loop for a given model and dataloader.
         """
         model.train()
-
-        # 冻结全连接层
-        # for name, param in model.named_parameters():
-        #     if name.startswith('fc'):  # 冻结所有以'fc'开头的层
-        #         param.requires_grad_(False)
-        # 优化所有未冻结参数
-        # optimizer = torch.optim.SGD(
-        #     filter(lambda p: p.requires_grad, model.parameters()),
-        #     lr=self.params.lr,
-        #     momentum=self.params.momentum
-        # )
-
         # 👉 收集特征/标签/后门标记用于可视化
         all_features = []
         all_labels = []
@@ -146,11 +261,11 @@ class MaliciousClient(BaseClient):
                 labels = labels.to(device=self.params.device, non_blocking=True)
 
                 # 判断哪些是后门样本
-                is_backdoor = torch.tensor(
-                    [idx in self.backdoor_indices for idx in global_indices],
-                    dtype=torch.bool,
-                    device=self.params.device
-                )
+                # is_backdoor = torch.tensor(
+                #     [idx in self.backdoor_indices for idx in global_indices],
+                #     dtype=torch.bool,
+                #     device=self.params.device
+                # )
 
                 if self.params.poison_type==2:
                     poisoning_index = self.Implant_trigger(inputs, labels)
@@ -160,7 +275,6 @@ class MaliciousClient(BaseClient):
                 # if delta_z is not None:
                 #     new_features = features + delta_z.unsqueeze(0).expand_as(features)
                 #     _, outputs = model(features=new_features)
-
                 # 分类损失
                 loss_cls = loss_func(outputs, labels)
 
@@ -176,24 +290,6 @@ class MaliciousClient(BaseClient):
                 loss.backward()
                 optimizer.step()
                 last_loss = loss.item()
-
-                # 👉 收集用于 t-SNE 的信息（移动到 CPU）
-                all_features.append(features.detach().cpu())
-                all_labels.append(labels.detach().cpu())
-                all_is_backdoor.append(is_backdoor.detach().cpu())
-
-        # ✅ 训练完成后可视化
-        features_np = torch.cat(all_features, dim=0).numpy()
-        labels_np = torch.cat(all_labels, dim=0).numpy()
-        is_backdoor_np = torch.cat(all_is_backdoor, dim=0).numpy()
-        
-        if self.visualize==1 and self.id==63 :
-            visualize_tsne(
-                features_np, labels_np, is_backdoor_np,
-                title=f't-SNE - Client (poison={self.params.poison_type})',
-                save=self.params.save_tsne if hasattr(self.params, 'save_tsne') else False,
-                save_path=f'tsne_client_{self.client_id}.png' if hasattr(self, 'client_id') else None
-            )
 
         return model, last_loss
 
@@ -284,7 +380,15 @@ class MaliciousClient(BaseClient):
         Also更新历史模型参数记录，用于后续的水印检测和调整。
         """
         self.epoch = epoch
-        if self.params.poison_type==1:
+        if self.params.poison_type == 1 and self.params.attack_type == 'sadba':
+            if epoch >= self.params.attack_epoch:
+                # 传入当前的 global_model (self.global_model)
+                self.apply_sadba_dynamic_trigger(self.global_model)
+                dataloader = self.m_train_loader
+            else:
+                dataloader = self.train_loader
+
+        elif self.params.poison_type==1:
             if epoch >= self.params.attack_epoch:
                 dataloader = self.m_train_loader
             else:

@@ -80,6 +80,8 @@ class Params:
     #恶意客户端
     backdoor_clients: list = None
 
+    sadba_recorded_positions: set = field(default_factory=set)
+
     negative_distillation: bool = False  # 是否启用负蒸馏
     negative_lambda: float = 1.0  # 负蒸馏强度超参数
     negative_distill_epochs: int = 5  # 负蒸馏训练轮数

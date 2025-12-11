@@ -86,7 +86,7 @@ class FreqFed:
         # 计算余弦距离矩阵
         distances_matrix = pairwise_distances(features, metric='cosine')
 
-        cluster = hdbscan.HDBSCAN(min_cluster_size=5, min_samples=1)
+        cluster = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1)
         cluster_labels = cluster.fit_predict(distances_matrix)  # 直接返回的是 ndarray
         cluster_labels = cluster_labels.tolist()  # 转为列表（可选）
 

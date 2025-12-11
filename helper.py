@@ -160,7 +160,7 @@ class Helper:
 
         # 2.根据客户端数目，创建正常客户端和恶意客户端
         for _id in range(self.params.clients):
-            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba','DarkFed']:
+            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba','DarkFed','sadba']:
                 self.clients.append(MaliciousClient(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))
             else:
                 self.clients.append(Client(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))

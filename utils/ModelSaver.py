@@ -29,7 +29,7 @@ class ModelSaver:
             return
 
         # === 判断是否最佳模型 ===
-        if acc_to_compare > self.best_acc:
+        if acc_to_compare >= self.best_acc:
             self.best_acc = acc_to_compare
 
             # ----★ 新增部分：攻击方法名称处理 ★----

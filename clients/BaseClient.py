@@ -12,20 +12,9 @@ class BaseClient:
         self.n_data = len(self.dataset)
 
     def train_model(self, model, dataloader, loss_func,teacher_model=None,mask=None,pattern=None,delta_z=None,predicted_model=None):
-        """
-        Standard training loop for a given model and dataloader.
-        """
         model.train()
         optimizer = torch.optim.SGD(model.parameters(), lr=self.params.lr, momentum=self.params.momentum)
         last_loss = None
-        # === ✅ 添加余弦退火调度器 ===
-        # T_max 设置为 local_ep * len(dataloader)，即一个完整训练周期（所有 batch）
-        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer,
-        #     T_max=self.params.local_ep * len(dataloader),
-        #     eta_min=1e-6  # 可调最小学习率
-        # )
-
         for _ in range(self.params.local_ep):
             for images, labels, _ in dataloader:
                 optimizer.zero_grad()

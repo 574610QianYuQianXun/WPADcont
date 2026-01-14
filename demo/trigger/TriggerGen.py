@@ -14,6 +14,7 @@ class TriggerGenerator:
         init_cost=1e-3,  # Reduced initial regularization cost
         lr=0.1,  # Lowered learning rate for stable optimizatio
         steps=100,  # Increased iteration steps
+        # steps=1,  # Increased iteration steps
         target_label=None,  # Now None, fetched from params
         mode="feature"  # New parameter: pixel / feature
     ):
@@ -50,6 +51,7 @@ class TriggerGenerator:
             self.target_label = target_label
         elif hasattr(params, 'aim_target'):
             self.target_label = params.aim_target
+            # self.target_label = 2
         else:
             self.target_label = 1  # Default value
             print(f"Warning: No target_label specified, using default value {self.target_label}")
@@ -340,21 +342,6 @@ class TriggerGenerator:
             print(f"Error in model feature forward: {e}")
             return 0, 0, 0
 
-        # # 未加入反向约束损失的损失函数
-        # loss_ce = criterion(output, y_batch)
-        # loss_reg = (self.delta_z ** 2).sum()
-        # loss = loss_ce + cost * loss_reg
-        #
-        # self.optimizer.zero_grad()
-        # loss.backward()
-        # torch.nn.utils.clip_grad_norm_([self.delta_z], max_norm=1.0)
-        # self.optimizer.step()
-        #
-        # acc = (output.argmax(dim=1) == y_batch).float().mean().item()
-        # return loss_ce.item(), loss_reg.item(), acc
-
-            # --- 主任务与正则 ---
-
         loss_ce = criterion(output, y_batch)
         loss_reg = (self.delta_z ** 2).sum()
 
@@ -380,11 +367,6 @@ class TriggerGenerator:
         self.optimizer.step()
 
         acc = (output.argmax(dim=1) == y_batch).float().mean().item()
-
-        # 可选打印监控
-        # if target_center is not None:
-        #     print(f"cos_sim(δ,target)={cos_sim.item():.4f}, anti_loss={anti_sim_loss.item():.4f}")
-
         return loss.item(), loss_ce.item() , loss_reg.item(), anti_sim_loss.item(), cos_sim.item(), acc
 
     def _visualize_feature_trigger(self):

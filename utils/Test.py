@@ -590,6 +590,8 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
                 current_model=model,  # 当前轮的全局模型
                 device=params.device,
             )
+        elif params.attack_type == 'a3fl':
+            print("A3FL Backdoor Testing... (inject in eval loop)")
         else:
             print("backdoor")
             utils.Backdoor_process(test_dataset_bd, params.origin_target, params.aim_target,params.task)
@@ -602,9 +604,36 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
     loader_bd = DataLoader(test_dataset_bd, batch_size=params.bs, shuffle=False)
     total_correct_backdoor, total_loss_backdoor, total_samples_backdoor = 0, 0.0, 0
 
+    import torchvision.transforms.functional as TF
+    from torchvision.utils import make_grid
+    vis_a3fl_done = False
     with torch.no_grad():
         for data, target in loader_bd:
             data, target = data.to(params.device), target.to(params.device)
+            if params.attack_type == 'a3fl':
+                if hasattr(params, "a3fl_patch") and params.a3fl_patch is not None:
+                    patch = params.a3fl_patch.to(params.device)  # [C,H,W]，已经带了 mask
+                    # 1. 整批加补丁
+                    data = torch.clamp(data + patch, 0.0, 1.0)
+                    # 2. 整批标签全改成目标类
+                    target[:] = params.aim_target
+                    # ---- 2) 只在第一批上可视化后门图像 ----
+                    if not vis_a3fl_done:
+                        n_show = min(16, data.size(0))  # 比如看前 16 张
+                        grid = make_grid(
+                            data[:n_show].cpu(),  # 搬到 CPU
+                            nrow=4,
+                            normalize=True,
+                            scale_each=True
+                        )
+                        plt.figure(figsize=(6, 6))
+                        plt.imshow(TF.to_pil_image(grid))
+                        plt.title("A3FL poisoned test samples")
+                        plt.axis("off")
+                        plt.show()
+
+                        vis_a3fl_done = True
+
             features, outputs_bd = model(data)
 
             # 展平特征并收集触发后的特征
@@ -626,6 +655,98 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
 
     acc_backdoor = 100.0 * safe_div(total_correct_backdoor, total_samples_backdoor)
     loss_backdoor = safe_div(total_loss_backdoor, total_samples_backdoor)
+
+    # -------------------------
+    # 3.5) 新增：计算 (x+trigger) 特征 - x 特征，并收集特征差
+    # 不改动旧逻辑，仅新增这一段
+    # -------------------------
+    collected_feature_diffs = []          # 每个样本的特征差 (triggered - clean)
+    collected_feature_diffs_labels = []   # 可选：存一下干净标签，方便后续分析
+
+    # 保证一一对应
+    if len(test_dataset_bd) != len(dataset):
+        print(f"[Warn] len(test_dataset_bd)={len(test_dataset_bd)} != len(dataset)={len(dataset)}; "
+              "feature diff will be computed on the min length by zip().")
+
+    loader_clean = DataLoader(dataset, batch_size=params.bs, shuffle=False)
+    loader_poison = DataLoader(test_dataset_bd, batch_size=params.bs, shuffle=False)
+
+    model.eval()
+    with torch.no_grad():
+        for (data_clean, target_clean), (data_bd_pair, target_bd_pair) in zip(loader_clean, loader_poison):
+            data_clean = data_clean.to(params.device)
+            data_bd_pair = data_bd_pair.to(params.device)
+            target_clean = target_clean.to(params.device)
+
+            # 注意：A3FL 的触发器是在 eval loop 里注入的，不一定真的写进了 test_dataset_bd
+            # 所以这里也做同样的注入，保证 data_bd_pair 真的是带触发器的输入
+            if params.attack_type == 'a3fl':
+                if hasattr(params, "a3fl_patch") and params.a3fl_patch is not None:
+                    patch = params.a3fl_patch.to(params.device)
+                    data_bd_pair = torch.clamp(data_bd_pair + patch, 0.0, 1.0)
+
+            # 分别提特征
+            feat_clean, _ = model(data_clean)
+            feat_bd, _ = model(data_bd_pair)
+
+            # 展平特征
+            if feat_clean.dim() > 2:
+                feat_clean = feat_clean.view(feat_clean.size(0), -1)
+            if feat_bd.dim() > 2:
+                feat_bd = feat_bd.view(feat_bd.size(0), -1)
+
+            # 计算特征差：triggered - clean
+            feat_diff = feat_bd - feat_clean
+
+            # 收集
+            collected_feature_diffs.append(feat_diff.detach().cpu())
+            collected_feature_diffs_labels.append(target_clean.detach().cpu())
+
+    # 拼成一个整体张量 / numpy，后续你想算均值方向 v_delta、余弦分布都方便
+    feature_diffs_tensor = torch.cat(collected_feature_diffs, dim=0)   # [N, D]
+    feature_diffs_np = feature_diffs_tensor.numpy()
+
+    # labels_clean_tensor = torch.cat(collected_feature_diffs_labels, dim=0)  # [N]
+    # labels_clean_np = labels_clean_tensor.numpy()
+
+    # feature_diffs_tensor: [N, D] torch tensor on CPU
+    # mean_diff = feature_diffs_tensor.mean(dim=0)  # [D]
+    # 或 numpy:
+    # mean_diff = feature_diffs_np.mean(axis=0)    # [D]
+    # feature_diffs_tensor: [N, D] torch tensor on CPU
+    mean_diff = feature_diffs_tensor.mean(dim=0)  # [D]
+
+    # -------------------------
+    # 新增：计算 mean_diff 与 delta_z 的余弦相似度
+    # -------------------------
+    if delta_z is not None:
+        # 统一成 torch 张量并放到 CPU
+        if torch.is_tensor(delta_z):
+            dz = delta_z.detach().cpu().float().view(-1)
+        else:
+            dz = torch.tensor(delta_z, dtype=torch.float32).view(-1)
+
+        md = mean_diff.detach().cpu().float().view(-1)
+
+        # 维度检查
+        if md.numel() != dz.numel():
+            print(f"[Warn] Dimension mismatch: mean_diff dim={md.numel()} vs delta_z dim={dz.numel()}. "
+                  "Skip cosine similarity.")
+        else:
+            md_norm = torch.norm(md, p=2)
+            dz_norm = torch.norm(dz, p=2)
+
+            if md_norm.item() < 1e-12 or dz_norm.item() < 1e-12:
+                print(f"[Warn] Zero-norm vector encountered: ||mean_diff||={md_norm.item():.3e}, "
+                      f"||delta_z||={dz_norm.item():.3e}. Skip cosine similarity.")
+            else:
+                cos_sim = torch.dot(md, dz) / (md_norm * dz_norm)
+                print(f"[Info] Cosine(mean_diff, delta_z) = {cos_sim.item():.6f}")
+    else:
+        print("[Info] delta_z not found or is None; skip cosine(mean_diff, delta_z).")
+
+    print(f"[Info] Collected feature diffs: {feature_diffs_tensor.shape}")
+
 
     # -------------------------
     # 4) 两个新测试：纯delta_z测试 和 噪声+delta_z测试
@@ -676,7 +797,7 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
             features_dict['trigger_names'] = trigger_names
             features_dict['trigger_similarities'] = trigger_similarities
 
-        # visualize_features_tsne(features_dict, delta_z=delta_z, save_path="tsne.png")
+        visualize_features_tsne(features_dict, delta_z=delta_z, mean_diff=mean_diff, save_path="tsne.png")
 
     except Exception:
         # 可视化失败无需中断流程
@@ -684,7 +805,6 @@ def Backdoor_Evaluate(model, dataset, loss_func, params,
 
     # 返回后门准确率、后门损失、干净准确率、干净损失
     return acc_backdoor, loss_backdoor, acc_all, loss_all
-
 
 
 def extract_trigger_features(model, params, delta_z=None, trigger_paths=None):
@@ -791,142 +911,412 @@ def extract_trigger_features(model, params, delta_z=None, trigger_paths=None):
     return trigger_features, trigger_names, trigger_similarities
 
 
-def visualize_features_tsne(features_dict, delta_z=None,
-                            perplexity=30, n_iter=1500, random_state=42,
-                            save_path=None, show_plot=True):
-    """
-    使用 t-SNE 可视化特征分布（2D）：
-      - 主任务特征：各个类别不同颜色
-      - 触发后的特征：蓝色x号标记
-      - delta_z测试特征：绿色小三角形标记
-      - 触发器图像特征：紫色菱形标记
-      - delta_z向量：红色星号
-    """
+# def visualize_features_tsne(features_dict, delta_z=None,mean_diff=None,
+#                             perplexity=30, n_iter=1500, random_state=42,
+#                             save_path=None, show_plot=True):
+#     """
+#     使用 t-SNE 可视化特征分布（2D）：
+#       - 主任务特征：各个类别不同颜色
+#       - 触发后的特征：蓝色x号标记
+#       - delta_z测试特征：绿色小三角形标记
+#       - 触发器图像特征：紫色菱形标记
+#       - delta_z向量：红色星号
+#     """
+#
+#     features = features_dict['features']
+#     labels = features_dict['labels']
+#
+#     if features.size == 0:
+#         print("Warning: No features to visualize")
+#         return
+#
+#     stack_list = [features]
+#     tag_list = labels.tolist()
+#
+#     # 加入触发后的特征 (标记为-2)
+#     if 'features_triggered' in features_dict and features_dict['features_triggered'].size > 0:
+#         triggered_features = features_dict['features_triggered']
+#         triggered_labels = features_dict['labels_triggered']
+#         stack_list.append(triggered_features)
+#         # 使用-2标记触发后的特征
+#         tag_list.extend([-2] * len(triggered_labels))
+#
+#     # 加入delta_z测试时的特征 (标记为-3)
+#     if 'features_delta_z' in features_dict and features_dict['features_delta_z'].size > 0:
+#         delta_z_features = features_dict['features_delta_z']
+#         delta_z_labels = features_dict['labels_delta_z']
+#         stack_list.append(delta_z_features)
+#         # 使用-3标记delta_z测试特征
+#         tag_list.extend([-3] * len(delta_z_labels))
+#
+#     # 加入触发器图像特征 (标记为-4)
+#     if 'trigger_features' in features_dict and features_dict['trigger_features'].size > 0:
+#         trigger_features = features_dict['trigger_features']
+#         trigger_names = features_dict.get('trigger_names', [])
+#         stack_list.append(trigger_features)
+#         # 使用-4标记触发器图像特征
+#         tag_list.extend([-4] * len(trigger_features))
+#
+#     # 加入 mean feature diff 向量 (标记为-6)
+#     if mean_diff is not None:
+#         md = mean_diff.cpu().numpy() if torch.is_tensor(mean_diff) else mean_diff
+#         md = md.reshape(1, -1)
+#         stack_list.append(md)
+#         tag_list.append(-6)
+#
+#     # 加入 delta_z 向量本身 (标记为-1)
+#     if delta_z is not None:
+#         dz = delta_z.cpu().numpy() if torch.is_tensor(delta_z) else delta_z
+#         dz = dz.reshape(1, -1)
+#         stack_list.append(dz)
+#         tag_list.append(-1)
+#
+#     X = np.vstack(stack_list)
+#
+#     # 检查特征数量
+#     if X.shape[0] < 2:
+#         print("Warning: Not enough samples for t-SNE visualization")
+#         return
+#
+#     # 调整perplexity以适应样本数量
+#     actual_perplexity = min(perplexity, (X.shape[0] - 1) // 3)
+#     if actual_perplexity < 5:
+#         actual_perplexity = 5
+#
+#     # 生成2D的t-SNE嵌入
+#     # tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity,n_iter=n_iter, random_state=random_state, init='pca')
+#     tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity, random_state=random_state, init='pca')
+#     X_emb_2d = tsne_2d.fit_transform(X)
+#
+#     # 创建图形
+#     fig, ax = plt.subplots(figsize=(12, 8))
+#
+#     # 获取正常类别（标签>=0）
+#     unique_labels = sorted(set(l for l in tag_list if l >= 0))
+#     palette = sns.color_palette("tab10", len(unique_labels))
+#
+#     # 画主任务特征（正常类别）
+#     for i, lab in enumerate(unique_labels):
+#         idx = [j for j, t in enumerate(tag_list) if t == lab]
+#         if len(idx) == 0:
+#             continue
+#         if lab == 7:  # 第8类（标签=7）固定为黑色
+#             ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
+#                       label=f"{lab}", s=20, alpha=0.7, color='black')
+#         else:
+#             ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
+#                       label=f"{lab}", s=20, alpha=0.7, color=palette[i % len(palette)])
+#
+#     # 画触发后的特征（蓝色x号，减小大小）
+#     triggered_idx = [j for j, t in enumerate(tag_list) if t == -2]
+#     if triggered_idx:
+#         ax.scatter(X_emb_2d[triggered_idx, 0], X_emb_2d[triggered_idx, 1],
+#                   label="Backdoor Features", s=40, c='blue', marker='x', alpha=0.8, linewidths=2)
+#
+#     # 画delta_z测试时的特征（绿色小三角形）
+#     delta_z_test_idx = [j for j, t in enumerate(tag_list) if t == -3]
+#     if delta_z_test_idx:
+#         ax.scatter(X_emb_2d[delta_z_test_idx, 0], X_emb_2d[delta_z_test_idx, 1],
+#                   label="Delta_z Test Features", s=30, c='green', marker='^', alpha=0.8)
+#
+#     # 画 mean feature diff 向量（橙色星号）
+#     md_idx = [j for j, t in enumerate(tag_list) if t == -6]
+#     if md_idx:
+#         print(f"Plotting Mean Feature Diff at coordinates: {X_emb_2d[md_idx]}")
+#         ax.scatter(X_emb_2d[md_idx, 0], X_emb_2d[md_idx, 1],
+#                    label="Mean Feature Diff (BD - Clean)", s=160,
+#                    c='orange', marker='*', edgecolors='black', linewidth=1,zorder=10)
+#
+#     # 画触发器图像特征（紫色菱形）
+#     trigger_img_idx = [j for j, t in enumerate(tag_list) if t == -4]
+#     if trigger_img_idx:
+#         trigger_names = features_dict.get('trigger_names', [])
+#         trigger_similarities = features_dict.get('trigger_similarities', [])
+#
+#         # 为每个触发器图像特征添加标签和相似度信息
+#         for k, idx in enumerate(trigger_img_idx):
+#             name = trigger_names[k] if k < len(trigger_names) else f"Trigger {k+1}"
+#             similarity = trigger_similarities[k] if k < len(trigger_similarities) else 0.0
+#             label_text = f"{name} (sim: {similarity:.3f})" if similarity != 0.0 else name
+#
+#             ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
+#                       label=label_text, s=120, c='purple', marker='D',
+#                       alpha=0.9, edgecolors='black', linewidth=1)
+#
+#     # 画 delta_z 向量本身（红色星号）
+#     dz_idx = [j for j, t in enumerate(tag_list) if t == -1]
+#     if dz_idx:
+#         ax.scatter(X_emb_2d[dz_idx, 0], X_emb_2d[dz_idx, 1],
+#                   label="Delta_z Vector", s=150, c='red', marker='*',
+#                   edgecolors='black', linewidth=1)
+#
+#     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+#     ax.set_title("t-SNE Feature Visualization")
+#     ax.set_xlabel("t-SNE Dimension 1")
+#     ax.set_ylabel("t-SNE Dimension 2")
+#
+#     plt.tight_layout()
+#
+#     if save_path:
+#         plt.savefig(save_path, dpi=300, bbox_inches='tight')
+#         print(f"t-SNE visualization saved to {save_path}")
+#
+#     if show_plot:
+#         plt.show()
+#
+#     plt.close()
 
-    features = features_dict['features']
-    labels = features_dict['labels']
+import matplotlib.patches as patches
 
-    if features.size == 0:
-        print("Warning: No features to visualize")
-        return
+def visualize_features_tsne(
+        features_dict,
+        delta_z=None,
+        mean_diff=None,
+        perplexity=30,
+        n_iter=1500,
+        random_state=42,
+        save_path=None,
+        show_plot=True,
+        show_class_legend=True,
+        legend_fontsize=15,
+):
+    # --------- 读取数据 ---------
+    features = features_dict.get('features', None)
+    labels = features_dict.get('labels', None)
+    if features is None or labels is None:
+        raise ValueError("features_dict must contain 'features' and 'labels'.")
+
+    features = np.asarray(features)
+    labels = np.asarray(labels)
 
     stack_list = [features]
     tag_list = labels.tolist()
 
-    # 加入触发后的特征 (标记为-2)
-    if 'features_triggered' in features_dict and features_dict['features_triggered'].size > 0:
-        triggered_features = features_dict['features_triggered']
-        triggered_labels = features_dict['labels_triggered']
+    # 可选：触发后的特征
+    if 'features_triggered' in features_dict and getattr(features_dict['features_triggered'], "size", 0) > 0:
+        triggered_features = np.asarray(features_dict['features_triggered'])
         stack_list.append(triggered_features)
-        # 使用-2标记触发后的特征
-        tag_list.extend([-2] * len(triggered_labels))
+        tag_list.extend([-2] * len(triggered_features))
 
-    # 加入delta_z测试时的特征 (标记为-3)
-    if 'features_delta_z' in features_dict and features_dict['features_delta_z'].size > 0:
-        delta_z_features = features_dict['features_delta_z']
-        delta_z_labels = features_dict['labels_delta_z']
+    # 可选：delta_z 测试特征
+    if 'features_delta_z' in features_dict and getattr(features_dict['features_delta_z'], "size", 0) > 0:
+        delta_z_features = np.asarray(features_dict['features_delta_z'])
         stack_list.append(delta_z_features)
-        # 使用-3标记delta_z测试特征
-        tag_list.extend([-3] * len(delta_z_labels))
+        tag_list.extend([-3] * len(delta_z_features))
 
-    # 加入触发器图像特征 (标记为-4)
-    if 'trigger_features' in features_dict and features_dict['trigger_features'].size > 0:
-        trigger_features = features_dict['trigger_features']
-        trigger_names = features_dict.get('trigger_names', [])
-        stack_list.append(trigger_features)
-        # 使用-4标记触发器图像特征
-        tag_list.extend([-4] * len(trigger_features))
+    # mean feature diff 向量 (标记 -6)
+    if mean_diff is not None:
+        if hasattr(mean_diff, "detach"):
+            md = mean_diff.detach().cpu().numpy()
+        else:
+            md = np.asarray(mean_diff)
+        stack_list.append(md.reshape(1, -1))
+        tag_list.append(-6)
 
-    # 加入 delta_z 向量本身 (标记为-1)
+    # delta_z 向量 (标记 -1)
     if delta_z is not None:
-        dz = delta_z.cpu().numpy() if torch.is_tensor(delta_z) else delta_z
-        dz = dz.reshape(1, -1)
-        stack_list.append(dz)
+        if hasattr(delta_z, "detach"):
+            dz = delta_z.detach().cpu().numpy()
+        else:
+            dz = np.asarray(delta_z)
+        stack_list.append(dz.reshape(1, -1))
         tag_list.append(-1)
 
     X = np.vstack(stack_list)
 
-    # 检查特征数量
-    if X.shape[0] < 2:
-        print("Warning: Not enough samples for t-SNE visualization")
-        return
-
-    # 调整perplexity以适应样本数量
+    # --------- t-SNE 计算 ---------
     actual_perplexity = min(perplexity, (X.shape[0] - 1) // 3)
-    if actual_perplexity < 5:
-        actual_perplexity = 5
+    actual_perplexity = max(actual_perplexity, 5)
 
-    # 生成2D的t-SNE嵌入
-    # tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity,n_iter=n_iter, random_state=random_state, init='pca')
-    tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity, random_state=random_state, init='pca')
+    try:
+        tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity, n_iter=n_iter, random_state=random_state,
+                       init='pca')
+    except TypeError:
+        tsne_2d = TSNE(n_components=2, perplexity=actual_perplexity, max_iter=n_iter, random_state=random_state,
+                       init='pca')
+
     X_emb_2d = tsne_2d.fit_transform(X)
 
-    # 创建图形
-    fig, ax = plt.subplots(figsize=(12, 8))
+    import os
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager as fm
 
-    # 获取正常类别（标签>=0）
-    unique_labels = sorted(set(l for l in tag_list if l >= 0))
-    palette = sns.color_palette("tab10", len(unique_labels))
-
-    # 画主任务特征（正常类别）
-    for i, lab in enumerate(unique_labels):
-        idx = [j for j, t in enumerate(tag_list) if t == lab]
-        if len(idx) == 0:
-            continue
-        if lab == 7:  # 第8类（标签=7）固定为黑色
-            ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
-                      label=f"{lab}", s=20, alpha=0.7, color='black')
+    def _set_times_new_roman_linux_ok(font_path=None):
+        """
+        优先 Times New Roman；Linux 若未安装则 fallback 到接近 Times 的衬线字体。
+        font_path: 可选，指向你自己的 Times New Roman .ttf 路径（最稳）。
+        """
+        # 1) 如果你手动提供了 ttf，就强制加载（最稳，Linux 一定生效）
+        if font_path is not None and os.path.exists(font_path):
+            fm.fontManager.addfont(font_path)
+            name = fm.FontProperties(fname=font_path).get_name()
+            plt.rcParams["font.family"] = "serif"
+            plt.rcParams["font.serif"] = [name]
         else:
-            ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
-                      label=f"{lab}", s=20, alpha=0.7, color=palette[i % len(palette)])
+            # 2) 否则：系统已安装则用 Times New Roman；否则用 Linux 常见替代
+            candidates = [
+                "Times New Roman",  # Windows / 手动安装后
+                "TeX Gyre Termes",  # Linux 常见（很像 Times）
+                "Nimbus Roman No9 L",  # Linux 常见（很像 Times）
+                "Nimbus Roman",
+                "Times",  # 兜底
+                "DejaVu Serif",  # 再兜底
+            ]
+            available = {f.name for f in fm.fontManager.ttflist}
+            chosen = next((c for c in candidates if c in available), "DejaVu Serif")
 
-    # 画触发后的特征（蓝色x号，减小大小）
+            plt.rcParams["font.family"] = "serif"
+            plt.rcParams["font.serif"] = [chosen]
+
+        # 3) 数学公式字体也尽量贴近 Times
+        plt.rcParams["mathtext.fontset"] = "stix"  # STIX 更像 Times 风格
+        plt.rcParams["axes.unicode_minus"] = False  # 负号显示正常
+
+    # 在你画图前调用一次即可（例如放在函数里、创建 fig 之前）
+    _set_times_new_roman_linux_ok(
+        font_path=None  # 如果你有 Times New Roman.ttf，填路径最稳
+    )
+
+
+    # --------- 开始绘图 ---------
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    # 1. 绘制普通样本点
+    unique_labels = sorted(set(l for l in tag_list if l >= 0))
+    cmap = plt.get_cmap("tab10")
+    for lab in unique_labels:
+        idx = [j for j, t in enumerate(tag_list) if t == lab]
+        if not idx: continue
+        ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1], s=20, alpha=0.55, color=cmap(lab % 10),
+                   label=f"Client{lab}" if show_class_legend else None, zorder=1)
+
+    # 2. 绘制额外点（Triggered / Delta Z Test）
     triggered_idx = [j for j, t in enumerate(tag_list) if t == -2]
     if triggered_idx:
-        ax.scatter(X_emb_2d[triggered_idx, 0], X_emb_2d[triggered_idx, 1],
-                  label="Backdoor Features", s=40, c='blue', marker='x', alpha=0.8, linewidths=2)
+        ax.scatter(X_emb_2d[triggered_idx, 0], X_emb_2d[triggered_idx, 1], s=26, c='blue', marker='x', alpha=0.6,
+                   zorder=2)
 
-    # 画delta_z测试时的特征（绿色小三角形）
     delta_z_test_idx = [j for j, t in enumerate(tag_list) if t == -3]
     if delta_z_test_idx:
-        ax.scatter(X_emb_2d[delta_z_test_idx, 0], X_emb_2d[delta_z_test_idx, 1],
-                  label="Delta_z Test Features", s=30, c='green', marker='^', alpha=0.8)
+        ax.scatter(X_emb_2d[delta_z_test_idx, 0], X_emb_2d[delta_z_test_idx, 1], s=18, c='green', marker='^',
+                   alpha=0.45, zorder=2)
 
-    # 画触发器图像特征（紫色菱形）
-    trigger_img_idx = [j for j, t in enumerate(tag_list) if t == -4]
-    if trigger_img_idx:
-        trigger_names = features_dict.get('trigger_names', [])
-        trigger_similarities = features_dict.get('trigger_similarities', [])
+    # 3. 获取特殊点坐标
+    md_idx = [j for j, t in enumerate(tag_list) if t == -6]  # 菱形
+    dz_idx = [j for j, t in enumerate(tag_list) if t == -1]  # 星星
 
-        # 为每个触发器图像特征添加标签和相似度信息
-        for k, idx in enumerate(trigger_img_idx):
-            name = trigger_names[k] if k < len(trigger_names) else f"Trigger {k+1}"
-            similarity = trigger_similarities[k] if k < len(trigger_similarities) else 0.0
-            label_text = f"{name} (sim: {similarity:.3f})" if similarity != 0.0 else name
+    md_xy = X_emb_2d[md_idx[0]] if md_idx else None
+    dz_xy = X_emb_2d[dz_idx[0]] if dz_idx else None
 
-            ax.scatter(X_emb_2d[idx, 0], X_emb_2d[idx, 1],
-                      label=label_text, s=120, c='purple', marker='D',
-                      alpha=0.9, edgecolors='black', linewidth=1)
+    # --------- 绘制红框 (核心修改部分) ---------
+    box_half_w, box_half_h = 0, 0  # 初始化用于后面计算箭头偏移
 
-    # 画 delta_z 向量本身（红色星号）
-    dz_idx = [j for j, t in enumerate(tag_list) if t == -1]
-    if dz_idx:
-        ax.scatter(X_emb_2d[dz_idx, 0], X_emb_2d[dz_idx, 1],
-                  label="Delta_z Vector", s=150, c='red', marker='*',
-                  edgecolors='black', linewidth=1)
+    if md_xy is not None and dz_xy is not None:
+        # 3.1 计算全局数据的跨度 (Span)，用于自适应框的大小
+        x_span = X_emb_2d[:, 0].max() - X_emb_2d[:, 0].min()
+        y_span = X_emb_2d[:, 1].max() - X_emb_2d[:, 1].min()
 
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.set_title("t-SNE Feature Visualization")
-    ax.set_xlabel("t-SNE Dimension 1")
-    ax.set_ylabel("t-SNE Dimension 2")
+        # 3.2 定义框的比例 (占总图宽高的 6% 到 8% 左右，视觉效果最像截图)
+        scale_ratio = 0.08
+        box_w = x_span * scale_ratio
+        box_h = y_span * scale_ratio
+
+        # 记录半宽半高，用于后续文字定位
+        box_half_w = box_w / 2
+        box_half_h = box_h / 2
+
+        # 3.3 计算两个特殊点的中心位置
+        center_x = (md_xy[0] + dz_xy[0]) / 2
+        center_y = (md_xy[1] + dz_xy[1]) / 2
+
+        # 3.4 绘制红框 (以中心点向四周扩散)
+        # xy参数是矩形左下角坐标
+        rect = patches.Rectangle(
+            (center_x - box_half_w, center_y - box_half_h),
+            box_w,
+            box_h,
+            linewidth=3.5,  # 红色线宽
+            edgecolor='red',  # 红框
+            facecolor='none',  # 透明内部
+            zorder=100  # 放在最上层
+        )
+        ax.add_patch(rect)
+
+    # 4. 绘制特殊点 (放在框画完之后，确保点在视觉上清晰)
+    if md_xy is not None:
+        ax.scatter(md_xy[0], md_xy[1], label=r"$\mathbf{v}_{\mathcal{T}}$",
+                   s=200, marker='D', c='purple', edgecolors='black', linewidth=1.6, zorder=110)
+
+    if dz_xy is not None:
+        ax.scatter(dz_xy[0], dz_xy[1], label=r"FST",
+                   s=250, marker='*', c='red', edgecolors='black', linewidth=1.4, zorder=111)
+
+    # 5. 添加文字标注 (根据框的大小自适应偏移)
+    # 截图风格：文字在框外，箭头指向点
+    offset_scale_x = box_half_w * 1.5  # 文字水平偏移量
+    offset_scale_y = box_half_h * 1.8  # 文字垂直偏移量
+
+    if md_xy is not None:
+        ax.annotate(
+            r"$\mathbf{v}_{\mathcal{T}}$",
+            xy=(md_xy[0], md_xy[1]),  # 箭头指向点
+            xytext=(md_xy[0] + offset_scale_x, md_xy[1] + offset_scale_y),  # 文字位置：右上
+            arrowprops=dict(arrowstyle='-', color='black', lw=1.2),  # 实线箭头
+            fontsize=15, fontweight='bold', zorder=120
+        )
+
+    if dz_xy is not None:
+        ax.annotate(
+            r"FST",
+            xy=(dz_xy[0], dz_xy[1]),  # 箭头指向点
+            xytext=(dz_xy[0] + offset_scale_x, dz_xy[1] - offset_scale_y),  # 文字位置：右下
+            arrowprops=dict(arrowstyle='-', color='black', lw=1.2),
+            fontsize=15, fontweight='bold', zorder=120
+        )
+
+    # --------- 图注与修饰 ---------
+    handles, labs = ax.get_legend_handles_labels()
+    final_handles, final_labels = [], []
+
+    # 筛选图注
+    for h, lab in zip(handles, labs):
+        if lab == r"$\mathbf{v}_{\mathcal{T}}$" or lab == r"FST":
+            final_handles.append(h)
+            final_labels.append(lab)
+
+    if show_class_legend:
+        class_items = []
+        for h, lab in zip(handles, labs):
+            if lab.startswith("Client") and (h, lab) not in zip(final_handles, final_labels):
+                class_items.append((h, lab))
+        class_items.sort(key=lambda x: int(x[1].replace("Client", "")))
+        for h, lab in class_items:
+            final_handles.append(h)
+            final_labels.append(lab)
+
+    if final_handles:
+        ax.legend(final_handles, final_labels, loc='lower right', frameon=True,
+                  fontsize=legend_fontsize)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.spines['top'].set_visible(True)
+    ax.spines['right'].set_visible(True)
+    ax.spines['bottom'].set_visible(True)  # 保留底边框线作为边界
+    ax.spines['left'].set_visible(True)  # 保留左边框线
 
     plt.tight_layout()
 
     if save_path:
+        base_name = os.path.splitext(os.path.basename(save_path))[0]
+        pdf_dir = os.path.dirname(save_path)
+        pdf_path = os.path.join(pdf_dir if pdf_dir else '.', f"{base_name}.pdf")
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"t-SNE visualization saved to {save_path}")
+        plt.savefig(pdf_path, bbox_inches="tight")
+        print(f"Saved to {save_path} and {pdf_path}")
 
     if show_plot:
         plt.show()
 
     plt.close()
+

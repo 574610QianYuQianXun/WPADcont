@@ -4,14 +4,16 @@ dataset: CIFAR10
 num_classes: 10
 model: ResNet18
 malicious: 0.2
+
+# DarkFed epoch为5
 attack_epoch: 0
 watermark: false
 defense: "no"
-attack_type: "How_backdoor"
+attack_type: "dba"
 poison_type: 1
-# "no" "How_backdoor" "dct"
-agg: "FreqFed"
-# DeepSight FedAvg FoolsGold FLShield FreqFed
+# "no" "How_backdoor" "dct" "dba" "DarkFed" "sadba" a3fl
+agg: "FedAvg"
+# DeepSight FedAvg FoolsGold FLShield FreqFed FndShield Rflbat krum multi_krum flame
 flshield_mode: "cluster"
 #"bijective" "cluster"
 a: 0.5
@@ -25,13 +27,19 @@ local_ep: 1
 
 save_model: False
 model_is_pretrained: True
-folder_path: 'trained_model/freqfed'
-is_back_model: False
+folder_path: 'trained_model'
+is_back_model: True
 
 #53-10
 purification_strategy: 'reverse_expert'  # 强制使用特征解毒53-10
 #purification_strategy: 'traditional'  # 强制使用特征解毒 17-0
 #purification_strategy: 'feature_unlearning'  # 强制使用特征解毒43-12
+
+pur_lr: 0.003
+pur_kd_lr: 0.00001
+#pur_w: 0.25 #dba
+pur_w: 0.3 #how_backdoor
+#pur_w: 0.225 #DarkFed
 
 origin_target: 8
 aim_target: 1

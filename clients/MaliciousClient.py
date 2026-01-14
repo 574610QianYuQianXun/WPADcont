@@ -53,6 +53,20 @@ class MaliciousClient(BaseClient):
 
         self.backdoor_indices = []  # 先初始化为空
 
+        """
+        A3FL 超参
+        """
+        self.a3fl_delta = None  # 可训练触发器，形状和 input_shape 一致，在 A3FL mask 区域生效
+        self.a3fl_mask = None  # A3FL 专用 mask，不用 self.mask
+        self.a3fl_patch = None  # 最终导出的 patch = a3fl_mask * a3fl_delta
+        self.a3fl_lambda_adv = getattr(self.params, "a3fl_lambda_adv", 1.0)
+        self.a3fl_K_outer = getattr(self.params, "a3fl_K_outer", 3)
+        self.a3fl_K_trigger = getattr(self.params, "a3fl_K_trigger", 3)
+        self.a3fl_lr_delta = getattr(self.params, "a3fl_lr_delta", 0.1)
+        self.a3fl_lr_adv = getattr(self.params, "a3fl_lr_adv", self.params.lr)
+        """
+        """
+
         if self.params.task == "MNIST":
             self.normalize = transforms.Normalize((0.1307,), (0.3081,))
         elif self.params.task == "CIFAR10":
@@ -69,7 +83,7 @@ class MaliciousClient(BaseClient):
             if self.params.attack_type=='dct':
                 frequency_backdoor(
                     train_set=self.backdoor_dataset,
-                    origin_target=self.params.origin_target,
+                    # origin_target=self.params.origin_target,
                     aim_target=self.params.aim_target
                     # strength=0.2,
                     # dct_positions=[(4, 5), (5, 4)]
@@ -260,15 +274,14 @@ class MaliciousClient(BaseClient):
                 inputs = images.to(device=self.params.device, non_blocking=True)
                 labels = labels.to(device=self.params.device, non_blocking=True)
 
-                # 判断哪些是后门样本
-                # is_backdoor = torch.tensor(
-                #     [idx in self.backdoor_indices for idx in global_indices],
-                #     dtype=torch.bool,
-                #     device=self.params.device
-                # )
-
-                if self.params.poison_type==2:
+                # poison_type==2 用原来的 mask+pattern，A3FL 单独处理
+                if self.params.poison_type == 2 and self.params.attack_type != 'a3fl':
                     poisoning_index = self.Implant_trigger(inputs, labels)
+
+                # A3FL：在攻击阶段，对当前 batch 动态注入自适应触发器
+                if self.params.attack_type == 'a3fl' and self.epoch >= self.params.attack_epoch:
+                    self.apply_a3fl_trigger_inplace(inputs, labels)
+
                 # _,outputs = model(inputs)
                 # 前向提取特征
                 features, outputs = model(inputs)
@@ -380,6 +393,23 @@ class MaliciousClient(BaseClient):
         Also更新历史模型参数记录，用于后续的水印检测和调整。
         """
         self.epoch = epoch
+        # === A3FL: 自适应后门本地训练 ===
+        if self.params.attack_type == 'a3fl':
+            # A3FL 不用预先构造 backdoor_dataset，直接在干净 dataloader 上训练
+            dataloader = self.train_loader
+
+            # 到达攻击轮之后，先根据当前 global_model 优化触发器
+            if epoch >= self.params.attack_epoch:
+                self.optimize_a3fl_trigger()
+
+            local_model = copy.deepcopy(self.global_model)
+            local_model, last_loss = self.train_model(
+                local_model, dataloader, loss_func,
+                teacher_model=teacher_model, mask=mask, pattern=pattern,
+                delta_z=delta_z, predicted_model=predicted_model
+            )
+            return local_model, last_loss
+
         if self.params.poison_type == 1 and self.params.attack_type == 'sadba':
             if epoch >= self.params.attack_epoch:
                 # 传入当前的 global_model (self.global_model)
@@ -444,6 +474,258 @@ class MaliciousClient(BaseClient):
         self.mask = 1 * (full_image != self.mask_value).to(self.params.device)
         self.pattern = self.normalize(full_image).to(self.params.device)
 
+    # === A3FL: 初始化触发器 ===
+    def init_a3fl_mask(self):
+        """
+        A3FL 专用 mask：
+
+        - 不使用 self.mask，也不依赖 pattern_tensor
+        - 默认：整张图全 1，触发器可以作用在任意位置
+        - 如果你想要“任意形状”的触发区域，可以在外面手动改 self.a3fl_mask 的 0/1 分布
+          例如：
+              mc.a3fl_mask = torch.zeros_like(mc.a3fl_mask)
+              mc.a3fl_mask[:, 3:8, 5:10] = 1     # 矩形
+              mc.a3fl_mask[:, some_bool_mask] = 1 # 任意形状
+        """
+        if self.a3fl_mask is not None:
+            return
+
+        self.a3fl_mask = torch.ones(self.input_shape, device=self.params.device)
+
+
+    def init_a3fl_delta(self):
+        self.init_a3fl_mask()
+        # 如果内存中已有，跳过
+        if self.a3fl_delta is not None:
+            return
+
+        # =======================================================
+        # 读取逻辑：从 saved_triggers/{task}/client_{id}/ 读取
+        # =======================================================
+        save_dir = os.path.join("saved_triggers", self.params.task, f"client_{self.id}")
+        file_name = "a3fl_trigger_checkpoint.pt"
+        trigger_path = os.path.join(save_dir, file_name)
+
+        if os.path.exists(trigger_path):
+            try:
+                print(f"[Client {self.id}] Loading trigger from {trigger_path}...")
+                checkpoint = torch.load(trigger_path, map_location=self.params.device)
+
+                loaded_delta = checkpoint['delta'].to(self.params.device)
+                loaded_delta.requires_grad_(True)  # 恢复梯度
+
+                self.a3fl_delta = loaded_delta
+
+                if 'mask' in checkpoint:
+                    self.a3fl_mask = checkpoint['mask'].to(self.params.device)
+
+                return  # 加载成功
+
+            except Exception as e:
+                print(f"[Client {self.id}] Error loading trigger: {e}. Falling back to random init.")
+        else:
+            print(f"[Client {self.id}] No checkpoint found at {trigger_path}. Starting fresh.")
+
+        # =======================================================
+        # 随机初始化
+        # =======================================================
+        self.a3fl_delta = torch.zeros(self.input_shape, device=self.params.device)
+        self.a3fl_delta.uniform_(-0.1, 0.1)
+        self.a3fl_delta.requires_grad_(True)
+
+    # 在一个 batch 上应用触发器（用于触发器优化阶段，默认对所有样本都加）
+    def apply_a3fl_delta(self, x):
+        self.init_a3fl_delta()
+        delta = self.a3fl_delta.to(self.params.device)
+        mask = self.a3fl_mask.to(self.params.device)
+        x_p = x + mask * delta
+        x_p = torch.clamp(x_p, 0.0, 1.0)
+        return x_p
+
+    # 在训练时，对一个 batch 按 poisoning_proportion 注入 A3FL 触发器 + 改标签
+    def apply_a3fl_trigger_inplace(self, data, labels):
+        """
+        data: [B, C, H, W] (已经在 device 上)
+        labels: [B]
+        按 poisoning_proportion 给前 n 个样本打上自适应触发器，并改成 aim_target
+        """
+        if self.a3fl_delta is None:
+            # 还没优化过触发器就算了，直接返回
+            return
+
+        n = int(len(data) * self.poisoning_proportion)
+        index = list(range(0, n))  # 和 Implant_trigger 类似，只是不 +1 了
+        for i in index:
+            if labels[i] == self.params.aim_target:
+                continue
+            x_i = data[i].unsqueeze(0)          # [1, C, H, W]
+            x_i = self.apply_a3fl_delta(x_i)   # 加触发器
+            data[i] = x_i.squeeze(0)
+            labels[i] = self.params.aim_target
+
+    # 关键：在本地根据当前 global_model 优化 (delta, adv_model)
+    def optimize_a3fl_trigger(self):
+        """
+        A3FL 触发器优化：
+        - fixed_model: 当前 global_model 的一份拷贝，不更新参数，用来评估攻击损失
+        - adv_model: 另一份拷贝，用来做“解除后门”的对抗模型
+        - a3fl_delta: 可训练触发器，在 mask 区域生效
+        """
+        import copy as _copy
+        import torch.nn as nn
+
+        device = self.params.device
+        self.init_a3fl_delta()
+
+        # 拷贝两份模型
+        fixed_model = _copy.deepcopy(self.global_model).to(device)
+        adv_model = _copy.deepcopy(self.global_model).to(device)
+
+        # 固定 fixed_model 参数，只让梯度传到输入/触发器
+        for p in fixed_model.parameters():
+            p.requires_grad_(False)
+        fixed_model.eval()
+        adv_model.train()
+
+        opt_delta = torch.optim.SGD([self.a3fl_delta], lr=self.a3fl_lr_delta)
+        opt_adv = torch.optim.SGD(adv_model.parameters(), lr=self.a3fl_lr_adv)
+        criterion = nn.CrossEntropyLoss()
+
+        for _ in range(self.a3fl_K_outer):
+            for images, labels, _ in self.train_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                # ---------- 内层：更新触发器 delta ----------
+                for _ in range(self.a3fl_K_trigger):
+                    opt_delta.zero_grad()
+
+                    x_p = self.apply_a3fl_delta(images)
+                    target_labels = torch.full_like(labels, self.params.aim_target)
+
+                    # 在 fixed_model (当前全局模型) 上的攻击损失
+                    _, logits_fixed = fixed_model(x_p)
+                    loss_fixed = criterion(logits_fixed, target_labels)
+
+                    # 在对抗模型 adv_model 上的攻击损失
+                    _, logits_adv = adv_model(x_p)
+                    loss_adv = criterion(logits_adv, target_labels)
+
+                    loss_attack = loss_fixed + self.a3fl_lambda_adv * loss_adv
+                    loss_attack.backward()
+                    opt_delta.step()
+
+                    # 限制触发器幅度，防止图像太爆炸
+                    with torch.no_grad():
+                        self.a3fl_delta.clamp_(-0.5, 0.5)
+
+                # ---------- 外层：更新 adv_model (解除后门) ----------
+                opt_adv.zero_grad()
+                # 当前触发器固定，只更新 adv_model 参数
+                x_p_clean = self.apply_a3fl_delta(images).detach()
+                x_p_clean.requires_grad_(True)
+                _, logits_clean = adv_model(x_p_clean)
+                loss_unlearn = criterion(logits_clean, labels)
+                loss_unlearn.backward()
+                opt_adv.step()
+
+        with torch.no_grad():
+            # 把“可以直接加到图片上的补丁”存进 params，方便测试使用
+            patch = (self.a3fl_mask * self.a3fl_delta).detach().cpu()
+            self.a3fl_patch= patch
+            self.params.a3fl_patch = patch
+            # 也顺便保存一下 poison 比例，测试时复用
+            self.params.a3fl_poisoning_proportion = self.poisoning_proportion
+
+            if self.params.save_model:
+                # =======================================================
+                # 保存逻辑：路径结构变为 saved_triggers/{task}/client_{id}/
+                # =======================================================
+                # 1. 构建包含 task 的目录路径
+                save_dir = os.path.join("saved_triggers", self.params.task, f"client_{self.id}")
+
+                # 2. 确保目录存在
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir, exist_ok=True)
+
+                # 3. 定义文件名 (因为目录已经区分了 task，文件名可以简单点，也可以保留)
+                file_name = "a3fl_trigger_checkpoint.pt"
+                trigger_path = os.path.join(save_dir, file_name)
+
+                save_data = {
+                    'delta': self.a3fl_delta.detach().cpu(),
+                    'mask': self.a3fl_mask.detach().cpu(),
+                    'epoch': self.epoch,
+                    'task': self.params.task
+                }
+
+                torch.save(save_data, trigger_path)
+                print(f"[Client {self.id}] Saved trigger to {trigger_path}")
+
+            try:
+                self.visualize_a3fl_trigger(
+                    show=True  # 如果你不想每轮弹窗，把这里改成 False
+                )
+            except Exception as e:
+                print(f"[Client {self.id}] Failed to visualize A3FL trigger: {e}")
+
+
+
+    def visualize_a3fl_trigger(self, save_path=None, show=True):
+        """
+        可视化 A3FL 学到的触发器 patch（self.a3fl_patch）.
+
+        - 会做一次 min-max 归一化到 [0,1]，方便看图
+        - C=1 时用灰度图，C=3 时用 RGB
+        - save_path 不为 None 时会保存成图片文件
+        """
+        if self.a3fl_patch is None:
+            print(f"[Client {self.id}] A3FL patch is None, nothing to visualize.")
+            return
+
+        patch = self.a3fl_patch.detach().cpu()  # [C,H,W]
+        if patch.dim() != 3:
+            print(f"[Client {self.id}] Unexpected patch shape: {patch.shape}")
+            return
+
+        # min-max 归一化到 [0,1]
+        p_min = patch.min()
+        p_max = patch.max()
+        if float(p_max - p_min) < 1e-8:
+            # 全常数就直接变成 0.5 灰，防止全黑
+            patch_norm = torch.zeros_like(patch) + 0.5
+        else:
+            patch_norm = (patch - p_min) / (p_max - p_min)
+
+        # 根据通道数选择显示方式
+        C, H, W = patch_norm.shape
+
+        plt.figure(figsize=(3, 3))
+        if C == 1:
+            img_show = patch_norm.squeeze(0).numpy()
+            plt.imshow(img_show, cmap="gray")
+        elif C == 3:
+            # [C,H,W] -> PIL
+            img_show = TF.to_pil_image(patch_norm)
+            plt.imshow(img_show)
+        else:
+            # 非 1/3 通道，用第一通道凑合看一下
+            img_show = patch_norm[0].numpy()
+            plt.imshow(img_show, cmap="gray")
+
+        plt.title(f"A3FL trigger (Client {self.id})")
+        plt.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+
     # 可视化 logits 输出为条形图
     @staticmethod
     def visualize_logits(outputs, labels, epoch=0, batch_idx=0, save_dir="logits_vis", max_samples=5, prefix="train"):
@@ -475,7 +757,6 @@ class MaliciousClient(BaseClient):
             save_path = os.path.join(save_dir, f"{prefix}_logits_e{epoch}_b{batch_idx}_s{i}.png")
             plt.savefig(save_path)
             plt.close()
-
 
 def visualize_tsne(features, labels, is_backdoor, title='t-SNE Feature Map', save=False, save_path=None):
     """
@@ -574,4 +855,58 @@ def visualize_backdoor_samples(dataset, n_samples=1, nrow=4):
         plt.title(" | ".join(labels))
         plt.axis("off")
         plt.show()
+
+    def visualize_a3fl_trigger(self, save_path=None, show=True):
+        """
+        可视化 A3FL 学到的触发器 patch（self.a3fl_patch）.
+
+        - 会做一次 min-max 归一化到 [0,1]，方便看图
+        - C=1 时用灰度图，C=3 时用 RGB
+        - save_path 不为 None 时会保存成图片文件
+        """
+        if self.a3fl_patch is None:
+            print(f"[Client {self.id}] A3FL patch is None, nothing to visualize.")
+            return
+
+        patch = self.a3fl_patch.detach().cpu()  # [C,H,W]
+        if patch.dim() != 3:
+            print(f"[Client {self.id}] Unexpected patch shape: {patch.shape}")
+            return
+
+        # min-max 归一化到 [0,1]
+        p_min = patch.min()
+        p_max = patch.max()
+        if float(p_max - p_min) < 1e-8:
+            # 全常数就直接变成 0.5 灰，防止全黑
+            patch_norm = torch.zeros_like(patch) + 0.5
+        else:
+            patch_norm = (patch - p_min) / (p_max - p_min)
+
+        # 根据通道数选择显示方式
+        C, H, W = patch_norm.shape
+
+        plt.figure(figsize=(3, 3))
+        if C == 1:
+            img_show = patch_norm.squeeze(0).numpy()
+            plt.imshow(img_show, cmap="gray")
+        elif C == 3:
+            # [C,H,W] -> PIL
+            img_show = TF.to_pil_image(patch_norm)
+            plt.imshow(img_show)
+        else:
+            # 非 1/3 通道，用第一通道凑合看一下
+            img_show = patch_norm[0].numpy()
+            plt.imshow(img_show, cmap="gray")
+
+        plt.title(f"A3FL trigger (Client {self.id})")
+        plt.axis("off")
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
 

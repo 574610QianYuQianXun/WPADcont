@@ -1667,8 +1667,10 @@ class ModelPurifier:
 
                 if delta_z.dim() == 1:
                     poisoned_features = benign_features + delta_z.unsqueeze(0).expand(batch_size, -1)
+                    # poisoned_features = delta_z.unsqueeze(0).expand(batch_size, -1)
                 else:
                     poisoned_features = benign_features + delta_z.expand(batch_size, -1)
+                    # poisoned_features = delta_z.unsqueeze(0).expand(batch_size, -1)
 
                 # 随机非目标标签
                 rand_idx = torch.randint(0, len(non_target_labels), (batch_size,), device=self.device)

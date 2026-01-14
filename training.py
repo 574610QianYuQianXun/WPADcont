@@ -621,8 +621,8 @@ def run_fl_round(helper: Helper, epoch, generator):
     # ====== 使用ModelPurifier对全局模型进行净化，消除后门 ======
     # if epoch > 1000:
 
-    if epoch >1000:
-    # if epoch >0:
+    # if epoch >1000:
+    if epoch >0:
         # 逆向生成触发器
         mask, pattern, delta_z = generator.generate(
             model=helper.global_model,
@@ -646,8 +646,8 @@ def run_fl_round(helper: Helper, epoch, generator):
         )
 
         # 使用ModelPurifier进行净化
-        if delta_z is not None:
-        # if delta_z is None:
+        # if delta_z is not None:
+        if delta_z is None:
             # 初始化净化器（如果还没有的话）
             if not hasattr(helper, 'model_purifier'):
                 helper.model_purifier = ModelPurifier(device=helper.params.device)
@@ -1157,7 +1157,7 @@ def evaluate_model(params, global_model, test_dataset, loss_func):
     若为后门攻击，则调用 Backdoor_Evaluate，并返回后门准确率；
     否则调用 Evaluate，back_acc 和 back_loss 返回 None。
     """
-    if params.attack_type in ['How_backdoor', 'dct', 'dba', 'DarkFed','sadba']:
+    if params.attack_type in ['How_backdoor', 'dct', 'dba', 'DarkFed','sadba','a3fl']:
         # 对测试集进行后门处理
         # test_dataset_ = deepcopy(test_dataset)
         # utils.Backdoor_process(test_dataset_, params.origin_target, params.aim_target)
@@ -1340,8 +1340,8 @@ def plot_target_label_trend(target_label_history, params):
 
 if __name__ == '__main__':
     # 读取 YAML 并创建参数对象
-    params = load_params_from_yaml('config/mnist_fed.yaml')
-    # params = load_params_from_yaml('config/cifar10_fed.yaml')
+    # params = load_params_from_yaml('config/mnist_fed.yaml')
+    params = load_params_from_yaml('config/cifar10_fed.yaml')
     # params = load_params_from_yaml('config/cifar100_fed.yaml')
     # params = load_params_from_yaml('config/TinyImageNet_fed.yaml')
 

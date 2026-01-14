@@ -71,16 +71,16 @@ class Helper:
         self.train_dataset, self.test_dataset, self.dict_users = utils.Download_data(self.params.dataset, 'dataset', self.params)
         # 如果攻击类型需要对测试集进行后门处理，则执行处理,加入触发器
         # Inject_watermark_test(self.test_dataset)
-        if self.params.attack_type=='dct':
-            # utils.Backdoor_process(self.test_dataset,self.params.origin_target,self.params.aim_target)
-            # 对测试集所有样本植入相同触发器（保持原标签）
-            frequency_backdoor(
-                train_set=self.test_dataset,
-                origin_target=self.params.origin_target,
-                modify_label=False,  # 关键区别
-                # strength=0.2
-                # trigger_pattern=[0.5, -0.5]  # 可调整模式
-            )
+        # if self.params.attack_type=='dct':
+        #     # utils.Backdoor_process(self.test_dataset,self.params.origin_target,self.params.aim_target)
+        #     # 对测试集所有样本植入相同触发器（保持原标签）
+        #     frequency_backdoor(
+        #         train_set=self.test_dataset,
+        #         origin_target=self.params.origin_target,
+        #         modify_label=False,  # 关键区别
+        #         # strength=0.2
+        #         # trigger_pattern=[0.5, -0.5]  # 可调整模式
+        #     )
 
         # if self.params.poison_type==1 and self.params.attack_type in ['How_backdoor','dba']:
         #     utils.Backdoor_process(self.test_dataset,self.params.origin_target,self.params.aim_target)
@@ -160,7 +160,7 @@ class Helper:
 
         # 2.根据客户端数目，创建正常客户端和恶意客户端
         for _id in range(self.params.clients):
-            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba','DarkFed','sadba']:
+            if _id in self.malicious_clients and self.params.attack_type in ['How_backdoor','dct','dba','DarkFed','sadba','a3fl']:
                 self.clients.append(MaliciousClient(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))
             else:
                 self.clients.append(Client(_id, self.params, self.global_model, self.train_dataset, self.dict_users[_id]))

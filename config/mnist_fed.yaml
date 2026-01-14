@@ -9,8 +9,8 @@ malicious: 0.2
 attack_epoch: 0
 watermark: false
 defense: "no"
-attack_type: "dba"
-# "no" "How_backdoor" "dct" "dba" "DarkFed"
+attack_type: "How_backdoor"
+# "no" "How_backdoor" "dct" "dba" "DarkFed" "sadba" a3fl
 
 poison_type: 1
 
@@ -18,7 +18,9 @@ agg: "FedAvg"
 # DeepSight FedAvg FoolsGold FLShield FreqFed FndShield Rflbat krum multi_krum flame
 flshield_mode: "cluster"
 #"bijective" "cluster"
+
 a: 0.5
+
 clients: 10
 epochs: 50
 local_bs: 64
@@ -28,8 +30,8 @@ lr: 0.01
 momentum: 0.5
 local_ep: 1
 
-save_model: True
-model_is_pretrained: False
+save_model: False
+model_is_pretrained: True
 folder_path: 'trained_model'
 is_back_model: True
 
